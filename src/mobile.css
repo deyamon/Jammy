@@ -23,8 +23,9 @@
 
 /* Non-host guests watch the host's YouTube player; the overlay blocks local seeking. */
 .youtube-player-viewport-wrap{position:relative}
-.youtube-control-lock{position:absolute;inset:0;z-index:2;display:grid;place-items:end center;padding:12px;background:transparent;cursor:not-allowed}
-.youtube-control-lock>span{padding:6px 10px;border-radius:999px;background:rgba(16,14,14,.78);color:var(--color-cotton);font-size:11px;font-weight:600;pointer-events:none}
+.youtube-control-lock{position:absolute;inset:0;z-index:2;display:grid;place-items:start start;padding:8px;background:transparent;cursor:not-allowed}
+.youtube-control-lock>span{padding:4px 8px;border-radius:999px;background:rgba(16,14,14,.72);color:var(--color-cotton);font-size:10px;font-weight:600;pointer-events:none}
+.youtube-control-lock:has(>button){place-items:center}
 .youtube-control-lock>button{min-height:44px;padding:0 18px;border:0;border-radius:10px;background:var(--accent-primary);color:var(--color-cotton);font-size:13px;font-weight:700;cursor:pointer;align-self:center}
 
 /* Touch devices: no sticky hover highlight after a tap. */

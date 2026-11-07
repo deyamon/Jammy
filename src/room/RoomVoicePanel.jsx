@@ -22,7 +22,7 @@ function useVoiceActivity({ joined, joining, muted, localStream, remoteStreams, 
     if (!AudioContextConstructor) return undefined
 
     let context
-    let animationFrame = 0
+    let sampleTimer = 0
     let cancelled = false
     const monitors = []
     try {
@@ -58,10 +58,10 @@ function useVoiceActivity({ joined, joining, muted, localStream, remoteStreams, 
           for (const key of keys) if (Boolean(previous[key]) !== Boolean(nextSpeaking[key])) return nextSpeaking
           return previous
         })
-        animationFrame = window.requestAnimationFrame(sample)
       }
       if (context.state === 'suspended') void context.resume().catch(() => {})
-      animationFrame = window.requestAnimationFrame(sample)
+      // ~7 checks a second is plenty for a speaking indicator and keeps phones responsive.
+      sampleTimer = window.setInterval(sample, 150)
     } catch {
       for (const monitor of monitors) {
         monitor.source.disconnect()
@@ -73,7 +73,7 @@ function useVoiceActivity({ joined, joining, muted, localStream, remoteStreams, 
     }
     return () => {
       cancelled = true
-      window.cancelAnimationFrame(animationFrame)
+      window.clearInterval(sampleTimer)
       for (const monitor of monitors) {
         monitor.source.disconnect()
         monitor.analyser.disconnect()

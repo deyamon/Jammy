@@ -35,7 +35,11 @@ const unavailable = {
 }
 
 // Seconds a guest may drift from the host before being snapped back.
-const GUEST_DRIFT_TOLERANCE_SECONDS = 2.5
+const GUEST_DRIFT_TOLERANCE_SECONDS = 4
+// Minimum gap between corrective seeks/plays so a slow phone never fights the player.
+const GUEST_CORRECTION_COOLDOWN_MS = 6000
+// After this many seeks without settling (ads, slow buffering) stop seeking until the host acts again.
+const GUEST_MAX_SEEKS_PER_UPDATE = 3
 
 const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, onState, onEnded, autoplayOnReady = false, startAtSeconds = 0, resumeAtSeconds, resumePlaying, placement = 'inline', controlsLocked = false }, ref) {
   const mountRef = useRef(null)
@@ -43,6 +47,12 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
   lockedRef.current = controlsLocked
   const sharedReceivedAtRef = useRef(Date.now())
   const wasPlayingWhenHiddenRef = useRef(false)
+  const lastCorrectionAtRef = useRef(0)
+  const seeksSinceUpdateRef = useRef(0)
+  // Browsers only allow play() after a user gesture; once a programmatic play fails,
+  // wait for the guest to tap instead of retrying in a loop.
+  const autoplayAllowedRef = useRef(true)
+  const pendingAutoplayCheckRef = useRef(false)
   const [localPlaying, setLocalPlaying] = useState(false)
   const [playerReady, setPlayerReady] = useState(false)
   const playerRef = useRef(null)
@@ -115,17 +125,29 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
     const YT = window.YT
     if (!lockedRef.current || !player || !playerReadyRef.current || !YT || !shared || shared.currentTrackId !== track?.id) return
     const state = player.getPlayerState?.()
-    if (state === YT.PlayerState.BUFFERING) return
+    if (pendingAutoplayCheckRef.current) {
+      // The last programmatic play never started: the browser wants a tap.
+      pendingAutoplayCheckRef.current = false
+      if (state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING) autoplayAllowedRef.current = false
+    }
+    if (state === YT.PlayerState.BUFFERING || Date.now() - lastCorrectionAtRef.current < GUEST_CORRECTION_COOLDOWN_MS) return
     const expected = expectedSharedSeconds(shared)
     const current = player.getCurrentTime?.() || 0
-    const needsSeek = Math.abs(current - expected) > GUEST_DRIFT_TOLERANCE_SECONDS
-    const needsPlay = shared.isPlaying && state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.ENDED
+    const duration = player.getDuration?.() || 0
+    const needsSeek = state === YT.PlayerState.PLAYING && Math.abs(current - expected) > GUEST_DRIFT_TOLERANCE_SECONDS
+      && seeksSinceUpdateRef.current < GUEST_MAX_SEEKS_PER_UPDATE && (!duration || expected < duration - 1)
+    const needsPlay = shared.isPlaying && autoplayAllowedRef.current && state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.ENDED
     const needsPause = !shared.isPlaying && state === YT.PlayerState.PLAYING
     if (!needsSeek && !needsPlay && !needsPause) return
+    lastCorrectionAtRef.current = Date.now()
     suppressEventsRef.current = true
     remoteCommandRef.current = { isPlaying: Boolean(shared.isPlaying), expiresAt: Date.now() + 60_000 }
-    if (needsSeek) player.seekTo(Math.max(0, expected), true)
-    if (needsPlay) player.playVideo?.()
+    if (needsSeek) { seeksSinceUpdateRef.current += 1; player.seekTo(Math.max(0, expected), true) }
+    if (needsPlay) {
+      if (Math.abs(current - expected) > GUEST_DRIFT_TOLERANCE_SECONDS) player.seekTo(Math.max(0, expected), true)
+      pendingAutoplayCheckRef.current = true
+      player.playVideo?.()
+    }
     if (needsPause) player.pauseVideo?.()
     window.setTimeout(() => { suppressEventsRef.current = false }, 900)
   }
@@ -237,17 +259,15 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
               : event.data === states.BUFFERING ? 'loading'
                 : event.data === states.PAUSED ? 'paused'
                   : event.data === states.ENDED ? 'ended' : 'ready'
-            setLocalPlaying(event.data === states.PLAYING)
+            setLocalPlaying((previous) => (previous === (event.data === states.PLAYING) ? previous : event.data === states.PLAYING))
+            if (event.data === states.PLAYING) { autoplayAllowedRef.current = true; pendingAutoplayCheckRef.current = false }
             handlersRef.current.onState?.({ status, currentTime: event.target.getCurrentTime?.() || 0, duration: event.target.getDuration?.() || 0, volume: event.target.getVolume?.() ?? 72, muted: Boolean(event.target.isMuted?.()), error: '' })
             if (event.data === states.ENDED) handlersRef.current.onEnded?.()
             const remote = remoteCommandRef.current
             const remoteMatches = isRoomCommandEcho(remote, status)
             if (remote && !remoteMatches) remoteCommandRef.current = null
-            // Guests can't change shared playback: snap back to the host instead.
-            if (lockedRef.current) {
-              if (!suppressEventsRef.current && !remoteMatches) window.setTimeout(() => enforceRef.current(event.target), 250)
-              return
-            }
+            // Guests never change shared playback; the periodic sync check keeps them with the host.
+            if (lockedRef.current) return
             // A browser pausing a backgrounded tab is not a host decision; don't broadcast it.
             const pausedByBackground = event.data === states.PAUSED && document.visibilityState === 'hidden'
             if (!suppressEventsRef.current && !remoteMatches && !pausedByBackground && (event.data === states.PLAYING || event.data === states.PAUSED)) {
@@ -267,7 +287,7 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
           volume: active.getVolume?.() ?? 72, muted: Boolean(active.isMuted?.()),
         })
         tick += 1
-        if (tick % 3 === 0 && document.visibilityState === 'visible') enforceRef.current(active)
+        if (tick % 4 === 0 && document.visibilityState === 'visible') enforceRef.current(active)
       }, 1000)
     }).catch((error) => handlersRef.current.onState?.({ status: 'error', error: error?.message || 'The YouTube player could not be initialized. Try selecting the video again.' }))
     return () => {
@@ -338,6 +358,7 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
     if (!player || !playerReadyRef.current || !sharedPlayback || sharedPlayback.currentTrackId !== track?.id || !sharedPlayback.updatedAt || sharedPlayback.updatedAt === lastRoomUpdateRef.current) return
     lastRoomUpdateRef.current = sharedPlayback.updatedAt
     sharedReceivedAtRef.current = Date.now()
+    seeksSinceUpdateRef.current = 0
     suppressEventsRef.current = true
     remoteCommandRef.current = { isPlaying: Boolean(sharedPlayback.isPlaying), expiresAt: Date.now() + 60_000 }
     const currentTime = player.getCurrentTime?.() || 0
@@ -355,6 +376,8 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
     const shared = sharedPlaybackRef.current
     suppressEventsRef.current = true
     if (shared) player.seekTo?.(Math.max(0, expectedSharedSeconds(shared)), true)
+    autoplayAllowedRef.current = true
+    lastCorrectionAtRef.current = Date.now()
     playYouTubeFromUserGesture(player)
     window.setTimeout(() => { suppressEventsRef.current = false }, 900)
   }
