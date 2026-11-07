@@ -3,8 +3,7 @@ import { audioStateReducer, initialAudioState, clampVolume, applyAudioMute, appl
 import { getAudioSource } from './audioSources.js'
 
 function unavailableMessageFor(trackId) {
-  if (trackId === 'local-audio-demo') return 'Add an authorized file at public/audio/ and set VITE_JAMMY_DEMO_AUDIO_URL.'
-  return 'This sample track has no authorized audio source. Configure the Local audio demo or choose a track with audio.'
+  return trackId ? 'Jammy currently plays YouTube videos in the YouTube player.' : 'Search YouTube and choose a video to start listening.'
 }
 
 function playbackError(audio) {
@@ -19,6 +18,7 @@ export function useAudioEngine({ track, roomActive = false, sharedPlayback = nul
   const stateRef = useRef(state)
   const sourceRef = useRef({ trackId: null, url: null })
   const autoplayOnLoadRef = useRef(false)
+  const pendingRestoreRef = useRef(null)
   const endedCallbackRef = useRef(onEnded)
   const roomActiveRef = useRef(roomActive)
   const sharedPlaybackRef = useRef(sharedPlayback)
@@ -79,6 +79,32 @@ export function useAudioEngine({ track, roomActive = false, sharedPlayback = nul
     autoplayOnLoadRef.current = true
   }, [])
 
+  const applyRestore = useCallback((audio, snapshot) => {
+    if (!audio || !snapshot || snapshot.trackId !== trackIdRef.current || audio.readyState < 1) return false
+    try {
+      const maxPosition = Number.isFinite(audio.duration) ? audio.duration : snapshot.position
+      audio.currentTime = Math.max(0, Math.min(snapshot.position, maxPosition))
+      dispatch({ type: 'TIME_UPDATE', currentTime: audio.currentTime })
+      if (snapshot.isPlaying) {
+        void audio.play().catch(() => dispatch({ type: 'PLAY_REJECTED', message: 'Your previous track could not resume automatically. Press Play to continue.' }))
+      } else {
+        audio.pause()
+      }
+      pendingRestoreRef.current = null
+      return true
+    } catch {
+      return false
+    }
+  }, [])
+
+  const restorePlayback = useCallback((snapshot) => {
+    if (!snapshot?.trackId || !Number.isFinite(snapshot.position)) return false
+    pendingRestoreRef.current = snapshot
+    const audio = audioRef.current
+    if (sourceRef.current.trackId === snapshot.trackId && applyRestore(audio, snapshot)) return true
+    return true
+  }, [applyRestore])
+
   useEffect(() => {
     const audio = audioRef.current
     if (!audio) return undefined
@@ -95,7 +121,12 @@ export function useAudioEngine({ track, roomActive = false, sharedPlayback = nul
         void audio.play().catch(() => dispatch({ type: 'PLAY_REJECTED', message: 'Your browser blocked playback started by the room. Press Play in this tab to allow audio.' }))
       } else if (!shared.isPlaying && !audio.paused) audio.pause()
     }
-    const onLoadedMetadata = () => { dispatch({ type: 'METADATA', duration: audio.duration }); applySharedPlayback() }
+    const onLoadedMetadata = () => {
+      dispatch({ type: 'METADATA', duration: audio.duration })
+      const restore = pendingRestoreRef.current
+      if (restore && applyRestore(audio, restore)) return
+      applySharedPlayback()
+    }
     const onTimeUpdate = () => dispatch({ type: 'TIME_UPDATE', currentTime: audio.currentTime })
     const onPlay = () => dispatch({ type: 'PLAY' })
     const onPause = () => dispatch({ type: 'PAUSE' })
@@ -127,7 +158,7 @@ export function useAudioEngine({ track, roomActive = false, sharedPlayback = nul
       audio.removeEventListener('error', onError)
       audio.removeEventListener('ended', onEndedEvent)
     }
-  }, [])
+  }, [applyRestore])
 
   useEffect(() => {
     const audio = audioRef.current
@@ -137,6 +168,7 @@ export function useAudioEngine({ track, roomActive = false, sharedPlayback = nul
 
     if (!sourceUrl) {
       autoplayOnLoadRef.current = false
+      if (pendingRestoreRef.current?.trackId === track?.id) pendingRestoreRef.current = null
       audio.removeAttribute('src')
       audio.load()
       dispatch({ type: 'UNAVAILABLE', message: unavailableMessageFor(track?.id) })
@@ -173,5 +205,5 @@ export function useAudioEngine({ track, roomActive = false, sharedPlayback = nul
     else if (!sharedPlayback.isPlaying && !audio.paused) audio.pause()
   }, [roomActive, sharedPlayback?.updatedAt, sharedPlayback?.isPlaying, sharedPlayback?.positionMs, sharedPlayback?.currentTrackId, track?.id, sourceUrl, play, seek])
 
-  return { audioRef, state, play, pause, seek, setVolume, toggleMute, requestAutoplayOnSelection }
+  return { audioRef, state, play, pause, seek, setVolume, toggleMute, requestAutoplayOnSelection, restorePlayback }
 }

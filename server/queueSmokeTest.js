@@ -51,6 +51,16 @@ function emitAck(socket, event, payload) {
   })
 }
 
+async function searchTrack(query) {
+  const { response, body } = await request(`/api/youtube/search?q=${encodeURIComponent(query)}`)
+  assert.equal(response.status, 200, 'queue smoke checks need the server YouTube search service')
+  const result = body.results?.[0]
+  assert.ok(result?.videoId && result.selectionToken, `YouTube returned no signed result for ${query}`)
+  return { trackId: `youtube:${result.videoId}`, trackData: result }
+}
+
+const addTrack = (socket, track) => emitAck(socket, 'queue:add', track)
+
 async function createRoom(name) {
   const { response, body } = await request('/api/rooms', {
     method: 'POST', body: JSON.stringify({ name, displayName: 'Host', maxMembers: 8 }),
@@ -60,6 +70,13 @@ async function createRoom(name) {
 }
 
 async function main() {
+  const [trackOne, trackTwo, trackThree, trackFour] = await Promise.all([
+    searchTrack('room smoke test ambient music'),
+    searchTrack('room smoke test jazz music'),
+    searchTrack('room smoke test instrumental music'),
+    searchTrack('room smoke test acoustic music'),
+  ])
+  assert.equal(new Set([trackOne.trackId, trackTwo.trackId, trackThree.trackId, trackFour.trackId]).size, 4, 'smoke test queries should resolve to distinct YouTube videos')
   const host = await createRoom('Queue smoke room')
   const hostSocket = await connect(host)
   const guestJoin = await request(`/api/rooms/${host.room.code}/join`, {
@@ -70,9 +87,9 @@ async function main() {
   const guestSocket = await connect(guest)
 
   const guestReceivesAdd = waitForSocketEvent(guestSocket, 'queue:state', (state) => state.queue.length === 1)
-  assert.equal((await emitAck(hostSocket, 'queue:add', { trackId: 'sunset-lover' })).ok, true)
+  assert.equal((await addTrack(hostSocket, trackOne)).ok, true)
   const guestQueue = await guestReceivesAdd
-  assert.equal(guestQueue.queue[0].trackId, 'sunset-lover')
+  assert.equal(guestQueue.queue[0].trackId, trackOne.trackId)
   console.log('✓ two independent room members receive the same live queue update')
 
   const unknownTrack = await emitAck(guestSocket, 'queue:add', { trackId: 'provider-injected-track' })
@@ -89,7 +106,7 @@ async function main() {
   const unrelatedSocket = await connect(unrelatedRoom)
   let unrelatedQueueEvents = 0
   unrelatedSocket.on('queue:state', () => { unrelatedQueueEvents += 1 })
-  await emitAck(hostSocket, 'queue:add', { trackId: 'show-me-how' })
+  await addTrack(hostSocket, trackTwo)
   await new Promise((resolve) => setTimeout(resolve, 200))
   assert.equal(unrelatedQueueEvents, 0, 'room queue events must not leak to unrelated rooms')
   console.log('✓ queue updates are scoped to their room')
@@ -104,7 +121,7 @@ async function main() {
   wrongRoomIdentity.disconnect()
   console.log('✓ unauthenticated socket cannot join or mutate a room')
 
-  const beforeReorder = waitForSocketEvent(guestSocket, 'queue:state', (state) => state.queue.length === 2 && state.queue[0].trackId === 'show-me-how')
+  const beforeReorder = waitForSocketEvent(guestSocket, 'queue:state', (state) => state.queue.length === 2 && state.queue[0].trackId === trackTwo.trackId)
   const roomState = await (async () => {
     const { response, body } = await request(`/api/rooms/${host.room.code}`, {
       headers: { Authorization: `Bearer ${host.memberToken}`, 'X-Room-Member-Id': host.member.id },
@@ -117,52 +134,69 @@ async function main() {
   assert.equal(reorderResult.ok, true)
   await beforeReorder
 
-  const selectedPlayback = waitForSocketEvent(hostSocket, 'playback:state', (state) => state.currentTrackId === 'show-me-how')
+  const guestSelect = await emitAck(guestSocket, 'playback:select', { itemId: reorderResult.state.queue[0].itemId, playImmediately: true })
+  assert.equal(guestSelect.ok, false)
+  assert.equal(guestSelect.code, 'ROOM_HOST_REQUIRED')
+  const selectedPlayback = waitForSocketEvent(guestSocket, 'playback:state', (state) => state.currentTrackId === trackTwo.trackId)
   const nextQueue = waitForSocketEvent(hostSocket, 'queue:state', (state) => state.queue.length === 1)
-  const selected = await emitAck(guestSocket, 'playback:select', { itemId: reorderResult.state.queue[0].itemId, playImmediately: true })
+  const selected = await emitAck(hostSocket, 'playback:select', { itemId: reorderResult.state.queue[0].itemId, playImmediately: true })
   assert.equal(selected.ok, true)
   assert.equal(selected.state.playback.isPlaying, true, 'selecting a track with Play starts synchronized playback immediately')
   await Promise.all([selectedPlayback, nextQueue])
   const playingState = waitForSocketEvent(guestSocket, 'playback:state', (state) => state.isPlaying && state.positionMs === 12000)
-  assert.equal((await emitAck(hostSocket, 'playback:update', { isPlaying: true, positionMs: 12000 })).ok, true)
+  const playbackUpdate = { isPlaying: true, positionMs: 12000, expectedTrackId: selected.state.playback.currentTrackId, expectedPlaybackToken: selected.state.playback.playbackToken }
+  const guestPause = await emitAck(guestSocket, 'playback:update', { ...playbackUpdate, isPlaying: false })
+  assert.equal(guestPause.ok, false)
+  assert.equal(guestPause.code, 'ROOM_HOST_REQUIRED')
+  assert.equal((await emitAck(hostSocket, 'playback:update', playbackUpdate)).ok, true)
   await playingState
-  assert.equal((await emitAck(hostSocket, 'playback:update', { isPlaying: true, positionMs: 12000 })).state.playback.isPlaying, true)
+  assert.equal((await emitAck(hostSocket, 'playback:update', playbackUpdate)).state.playback.isPlaying, true)
   console.log('✓ queue reorder and selected-track playback state synchronize without audio')
 
-  const nextState = await emitAck(hostSocket, 'playback:next', { expectedTrackId: 'show-me-how', expectedPlaybackToken: selected.state.playback.playbackToken })
+  const guestSkip = await emitAck(guestSocket, 'playback:skip', { expectedTrackId: trackTwo.trackId, expectedPlaybackToken: selected.state.playback.playbackToken })
+  const guestNext = await emitAck(guestSocket, 'playback:next', { expectedTrackId: trackTwo.trackId, expectedPlaybackToken: selected.state.playback.playbackToken })
+  const guestRepeat = await emitAck(guestSocket, 'playback:repeat', { repeatMode: 'one' })
+  for (const rejected of [guestSkip, guestNext, guestRepeat]) {
+    assert.equal(rejected.ok, false)
+    assert.equal(rejected.code, 'ROOM_HOST_REQUIRED')
+  }
+  const nextState = await emitAck(hostSocket, 'playback:next', { expectedTrackId: trackTwo.trackId, expectedPlaybackToken: selected.state.playback.playbackToken })
   assert.equal(nextState.ok, true)
-  assert.equal(nextState.state.playback.currentTrackId, 'sunset-lover')
+  assert.equal(nextState.state.playback.currentTrackId, trackOne.trackId)
   assert.equal(nextState.state.playback.isPlaying, true)
-  const duplicateEndedEvent = await emitAck(guestSocket, 'playback:next', { expectedTrackId: 'show-me-how', expectedPlaybackToken: selected.state.playback.playbackToken })
+  const duplicateEndedEvent = await emitAck(hostSocket, 'playback:next', { expectedTrackId: trackTwo.trackId, expectedPlaybackToken: selected.state.playback.playbackToken })
   assert.equal(duplicateEndedEvent.ok, true)
-  assert.equal(duplicateEndedEvent.state.playback.currentTrackId, 'sunset-lover', 'stale ended events must not skip another queued track')
+  assert.equal(duplicateEndedEvent.state.playback.currentTrackId, trackOne.trackId, 'stale ended events must not skip another queued track')
   console.log('✓ room auto-advance is idempotent for stale cross-client ended events')
 
   const repeatOne = await emitAck(hostSocket, 'playback:repeat', { repeatMode: 'one' })
   assert.equal(repeatOne.ok, true)
   assert.equal(repeatOne.state.playback.repeatMode, 'one')
-  const repeatedOne = await emitAck(guestSocket, 'playback:next', { expectedTrackId: 'sunset-lover', expectedPlaybackToken: repeatOne.state.playback.playbackToken })
-  assert.equal(repeatedOne.state.playback.currentTrackId, 'sunset-lover')
+  const repeatedOne = await emitAck(hostSocket, 'playback:next', { expectedTrackId: trackOne.trackId, expectedPlaybackToken: repeatOne.state.playback.playbackToken })
+  assert.equal(repeatedOne.state.playback.currentTrackId, trackOne.trackId)
   assert.equal(repeatedOne.state.playback.isPlaying, true)
   assert.equal(repeatedOne.state.playback.positionMs, 0)
   console.log('✓ Repeat One restarts the current room track on a synchronized end event')
 
-  await emitAck(hostSocket, 'queue:add', { trackId: 'sunset-lover' })
-  await emitAck(hostSocket, 'queue:add', { trackId: 'tadow' })
-  const repeatAll = await emitAck(guestSocket, 'playback:repeat', { repeatMode: 'all' })
+  await addTrack(hostSocket, trackOne)
+  await addTrack(hostSocket, trackThree)
+  const guestRepeatAll = await emitAck(guestSocket, 'playback:repeat', { repeatMode: 'all' })
+  assert.equal(guestRepeatAll.ok, false)
+  assert.equal(guestRepeatAll.code, 'ROOM_HOST_REQUIRED')
+  const repeatAll = await emitAck(hostSocket, 'playback:repeat', { repeatMode: 'all' })
   assert.equal(repeatAll.state.playback.repeatMode, 'all')
-  const repeatedAll = await emitAck(hostSocket, 'playback:next', { expectedTrackId: 'sunset-lover', expectedPlaybackToken: repeatAll.state.playback.playbackToken })
-  assert.equal(repeatedAll.state.playback.currentTrackId, 'sunset-lover', 'Repeat All can select another queued entry for the same video')
+  const repeatedAll = await emitAck(hostSocket, 'playback:next', { expectedTrackId: trackOne.trackId, expectedPlaybackToken: repeatAll.state.playback.playbackToken })
+  assert.equal(repeatedAll.state.playback.currentTrackId, trackOne.trackId, 'Repeat All can select another queued entry for the same video')
   assert.notEqual(repeatedAll.state.playback.playbackToken, repeatAll.state.playback.playbackToken)
-  assert.equal(repeatedAll.state.queue.at(-1).trackId, 'sunset-lover')
-  const duplicateRepeatAll = await emitAck(guestSocket, 'playback:next', { expectedTrackId: 'sunset-lover', expectedPlaybackToken: repeatAll.state.playback.playbackToken })
-  assert.equal(duplicateRepeatAll.state.playback.currentTrackId, 'sunset-lover', 'a duplicate end event for the same video entry must not advance twice')
-  const skipped = await emitAck(hostSocket, 'playback:skip', { expectedTrackId: 'sunset-lover', expectedPlaybackToken: repeatedAll.state.playback.playbackToken })
-  assert.equal(skipped.state.playback.currentTrackId, 'tadow')
+  assert.equal(repeatedAll.state.queue.at(-1).trackId, trackOne.trackId)
+  const duplicateRepeatAll = await emitAck(hostSocket, 'playback:next', { expectedTrackId: trackOne.trackId, expectedPlaybackToken: repeatAll.state.playback.playbackToken })
+  assert.equal(duplicateRepeatAll.state.playback.currentTrackId, trackOne.trackId, 'a duplicate end event for the same video entry must not advance twice')
+  const skipped = await emitAck(hostSocket, 'playback:skip', { expectedTrackId: trackOne.trackId, expectedPlaybackToken: repeatedAll.state.playback.playbackToken })
+  assert.equal(skipped.state.playback.currentTrackId, trackThree.trackId)
   console.log('✓ Repeat All rotates the room queue and explicit next remains idempotent')
 
   for (const item of skipped.state.queue) {
-    const removed = await emitAck(hostSocket, 'queue:remove', { itemId: item.itemId })
+    const removed = await emitAck(guestSocket, 'queue:remove', { itemId: item.itemId })
     assert.equal(removed.ok, true)
   }
 
@@ -174,11 +208,11 @@ async function main() {
 
   const finalSize = waitForSocketEvent(guestSocket, 'queue:state', (state) => state.queue.length === 50)
   for (let index = 0; index < 50; index += 1) {
-    const result = await emitAck(hostSocket, 'queue:add', { trackId: index % 2 ? 'tadow' : 'sweet-disposition' })
+    const result = await addTrack(hostSocket, index % 2 ? trackThree : trackFour)
     assert.equal(result.ok, true, `track ${index + 1} should fit in the queue`)
   }
   await finalSize
-  const overflow = await emitAck(hostSocket, 'queue:add', { trackId: 'sunset-lover' })
+  const overflow = await addTrack(hostSocket, trackOne)
   assert.equal(overflow.ok, false)
   assert.equal(overflow.code, 'QUEUE_FULL')
   console.log('✓ queue accepts 50 items and rejects item 51')

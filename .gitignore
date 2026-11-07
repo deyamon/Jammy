@@ -13,3 +13,4 @@ lerna-debug.log*
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+.neon

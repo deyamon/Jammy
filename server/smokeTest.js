@@ -65,6 +65,10 @@ async function main() {
   assert.equal(health.status, 'ok')
   console.log(`✓ health endpoint (${health.roomStore} room store)`)
 
+  const removedProviderResponse = await request('/api/spotify/search?q=test')
+  assert.equal(removedProviderResponse.status, 404, 'removed provider routes should not remain available')
+  console.log('✓ removed provider route returns not found')
+
   const invalidCode = await request('/api/rooms/!!!/join', {
     method: 'POST', body: JSON.stringify({ displayName: 'Guest' }),
   })
@@ -144,24 +148,36 @@ async function main() {
   await Promise.all([hostSeesGuestReconnect, guestSeesReconnect])
   console.log('✓ disconnected guest went offline and reconnected within the grace period')
 
+  const guestSeesHostOffline = waitForSocketEvent(guestSocket, 'room:state', (state) => state.members.some((member) => member.id === hostSession.member.id && member.role === 'owner' && !member.online))
+  hostSocket.disconnect()
+  await guestSeesHostOffline
+  const guestSeesHostReconnect = waitForSocketEvent(guestSocket, 'room:state', (state) => state.members.some((member) => member.id === hostSession.member.id && member.role === 'owner' && member.online))
+  await reconnect(hostSocket, (state) => state.members.some((member) => member.id === hostSession.member.id && member.role === 'owner' && member.online))
+  await guestSeesHostReconnect
+  console.log('✓ host retains ownership and reconnects within the grace period')
+
   const fullRoomResponse = await request(`/api/rooms/${hostSession.room.code}/join`, {
     method: 'POST', body: JSON.stringify({ displayName: 'Third guest' }),
   })
   assert.equal(fullRoomResponse.status, 409, 'full room should reject another participant')
   console.log('✓ full room rejected another participant')
 
-  const hostSeesGuestLeave = waitForSocketEvent(hostSocket, 'room:state', (state) => state.members.length === 1)
-  const leaveGuestResponse = await request(`/api/rooms/${guestSession.room.code}/leave`, {
-    method: 'DELETE', headers: { Authorization: `Bearer ${guestSession.memberToken}`, 'X-Room-Member-Id': guestSession.member.id },
-  })
-  assert.equal(leaveGuestResponse.status, 200)
-  await hostSeesGuestLeave
-  console.log('✓ guest left; host received the updated participant list')
-
+  const guestSeesHostTransfer = waitForSocketEvent(guestSocket, 'room:state', (state) => state.members.length === 1 && state.members[0].id === guestSession.member.id && state.members[0].role === 'owner')
   const leaveHostResponse = await request(`/api/rooms/${hostSession.room.code}/leave`, {
     method: 'DELETE', headers: { Authorization: `Bearer ${hostSession.memberToken}`, 'X-Room-Member-Id': hostSession.member.id },
   })
   assert.equal(leaveHostResponse.status, 200)
+  await guestSeesHostTransfer
+  console.log('✓ voluntary host departure promotes the remaining member')
+
+  const leaveGuestResponse = await request(`/api/rooms/${guestSession.room.code}/leave`, {
+    method: 'DELETE', headers: { Authorization: `Bearer ${guestSession.memberToken}`, 'X-Room-Member-Id': guestSession.member.id },
+  })
+  assert.equal(leaveGuestResponse.status, 200)
+  const closedRoomJoin = await request(`/api/rooms/${guestSession.room.code}/join`, {
+    method: 'POST', body: JSON.stringify({ displayName: 'After close' }),
+  })
+  assert.equal(closedRoomJoin.status, 404, 'the final leave should remove the empty room')
   console.log('✓ final participant left and empty room was closed')
 }
 

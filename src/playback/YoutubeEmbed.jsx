@@ -1,5 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
 import { isRoomCommandEcho } from './roomCommandGuard.js'
+import { applyRoomPlaybackCommand, playYouTubeFromUserGesture, restoreYouTubePlayback } from './youtubeCommands.js'
+import { isValidYouTubeVideoId } from './soloYouTubePlayback.js'
 
 let apiPromise
 function loadYouTubeApi() {
@@ -41,6 +43,7 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
   const lastVideoIdRef = useRef(null)
   const playbackObserverRef = useRef(null)
   const pendingPlayRef = useRef(false)
+  const pendingRestoreRef = useRef(null)
   const handlersRef = useRef({ onState, onEnded })
   const sharedPlaybackRef = useRef(sharedPlayback)
   handlersRef.current = {
@@ -48,7 +51,13 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
     onEnded,
   }
   sharedPlaybackRef.current = sharedPlayback
-  const videoId = track?.provider === 'youtube' ? track.videoId : null
+  const videoId = track?.provider === 'youtube' && isValidYouTubeVideoId(track.videoId) ? track.videoId : null
+
+  useEffect(() => {
+    if (track?.provider === 'youtube' && !isValidYouTubeVideoId(track.videoId)) {
+      handlersRef.current.onState?.({ status: 'error', error: 'This YouTube video is missing a valid video ID and cannot be played.' })
+    }
+  }, [track?.id, track?.provider, track?.videoId])
 
   const cancelPendingPlay = () => {
     pendingPlayRef.current = false
@@ -88,6 +97,12 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
   useImperativeHandle(ref, () => ({
     canControl: () => Boolean(playerReadyRef.current && playerRef.current),
     play: () => requestPlayerPlay(playerRef.current),
+    playFromUserGesture: () => {
+      const player = playerRef.current
+      if (!player || !playerReadyRef.current) return false
+      cancelPendingPlay()
+      return playYouTubeFromUserGesture(player)
+    },
     pause: () => { cancelPendingPlay(); playerRef.current?.pauseVideo?.() },
     applyRoomCommand: ({ isPlaying, positionMs }) => {
       const player = playerRef.current
@@ -95,15 +110,25 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
       const desiredPlaying = Boolean(isPlaying)
       remoteCommandRef.current = { isPlaying: desiredPlaying, expiresAt: Date.now() + 60_000 }
       suppressEventsRef.current = true
-      if (Number.isFinite(positionMs)) player.seekTo(Math.max(0, positionMs / 1000), true)
-      if (desiredPlaying) requestPlayerPlay(player)
-      else { cancelPendingPlay(); player.pauseVideo?.() }
+      cancelPendingPlay()
+      applyRoomPlaybackCommand(player, { isPlaying: desiredPlaying, positionMs })
       window.setTimeout(() => { suppressEventsRef.current = false }, 900)
       return true
     },
     seek: (seconds) => playerRef.current?.seekTo?.(Math.max(0, seconds), true),
     setVolume: (volume) => playerRef.current?.setVolume?.(Math.max(0, Math.min(100, volume))),
     getCurrentTime: () => playerRef.current?.getCurrentTime?.() ?? 0,
+    getIsPlaying: () => playerRef.current?.getPlayerState?.() === window.YT?.PlayerState?.PLAYING,
+    restorePlayback: (snapshot) => {
+      if (!snapshot || !Number.isFinite(snapshot.position)) return false
+      const player = playerRef.current
+      if (!player || !playerReadyRef.current) {
+        pendingRestoreRef.current = snapshot
+        return true
+      }
+      cancelPendingPlay()
+      return restoreYouTubePlayback(player, snapshot)
+    },
     suspend: () => {
       const player = playerRef.current
       if (!player || !playerReadyRef.current) return null
@@ -147,14 +172,18 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
             playerReadyRef.current = true
             lastVideoIdRef.current = videoId
             const shared = sharedPlaybackRef.current
+            const pendingRestore = pendingRestoreRef.current
             let visibleForPlayback = true
-            if (shared?.currentTrackId === track.id && shared.updatedAt) {
+            if (pendingRestore?.trackId === track.id) {
+              pendingRestoreRef.current = null
+              restoreYouTubePlayback(event.target, pendingRestore)
+            } else if (shared?.currentTrackId === track.id && shared.updatedAt) {
               lastRoomUpdateRef.current = shared.updatedAt
               const shouldPlay = typeof resumePlaying === 'boolean' ? resumePlaying : Boolean(shared.isPlaying)
               const startAt = Number.isFinite(resumeAtSeconds) ? resumeAtSeconds : shared.positionMs / 1000
               remoteCommandRef.current = { isPlaying: shouldPlay, expiresAt: Date.now() + 60_000 }
               if (Number.isFinite(startAt) && startAt > 0) event.target.seekTo(startAt, true)
-              if (shouldPlay) visibleForPlayback = requestPlayerPlay(event.target)
+              if (shouldPlay) { cancelPendingPlay(); playYouTubeFromUserGesture(event.target) }
               else { cancelPendingPlay(); event.target.pauseVideo() }
             } else {
               const startAt = Number.isFinite(startAtSeconds) ? Math.max(0, startAtSeconds) : 0
@@ -190,7 +219,7 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
           volume: active.getVolume?.() ?? 72, muted: Boolean(active.isMuted?.()),
         })
       }, 1000)
-    }).catch((error) => handlersRef.current.onState?.({ status: 'error', error: error.message }))
+    }).catch((error) => handlersRef.current.onState?.({ status: 'error', error: error?.message || 'The YouTube player could not be initialized. Try selecting the video again.' }))
     return () => {
       disposed = true
       window.clearInterval(pollId)
@@ -199,6 +228,7 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
       playerRef.current = null
       playerReadyRef.current = false
       lastVideoIdRef.current = null
+      pendingRestoreRef.current = null
     }
   }, [videoId])
 
@@ -221,7 +251,7 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
     remoteCommandRef.current = { isPlaying: Boolean(sharedPlayback.isPlaying), expiresAt: Date.now() + 60_000 }
     const currentTime = player.getCurrentTime?.() || 0
     if (Number.isFinite(sharedPlayback.positionMs) && Math.abs(currentTime - sharedPlayback.positionMs / 1000) > 1) player.seekTo(Math.max(0, sharedPlayback.positionMs / 1000), true)
-    if (sharedPlayback.isPlaying) requestPlayerPlay(player)
+    if (sharedPlayback.isPlaying) { cancelPendingPlay(); player.playVideo?.() }
     else { cancelPendingPlay(); player.pauseVideo() }
     window.setTimeout(() => { suppressEventsRef.current = false }, 900)
   }, [sharedPlayback?.updatedAt, sharedPlayback?.isPlaying, sharedPlayback?.positionMs, sharedPlayback?.currentTrackId, track?.id])

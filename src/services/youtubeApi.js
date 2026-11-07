@@ -1,4 +1,4 @@
-const apiBase = import.meta.env.VITE_API_URL?.replace(/\/$/, '') || 'http://localhost:3001'
+const apiBase = import.meta.env?.VITE_API_URL?.replace(/\/$/, '') || 'http://localhost:3001'
 
 export async function searchYouTube(query, { signal } = {}) {
   const response = await fetch(`${apiBase}/api/youtube/search?q=${encodeURIComponent(query)}`, { signal })

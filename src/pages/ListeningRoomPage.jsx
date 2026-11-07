@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import Icon from '../components/Icon.jsx'
-import { tracks } from '../../shared/catalog.js'
 import { leaveRoom } from '../services/roomApi.js'
 import { connectToRoom } from '../services/roomSocket.js'
 import { asYouTubeTrack, searchYouTube } from '../services/youtubeApi.js'
 import { getTrackLyrics } from '../services/lyricsProvider.js'
 import { acceptYouTubeNotice, hasYouTubeConsent } from '../services/youtubeConsent.js'
+import { getRoomProgressState } from '../playback/roomPlaybackProgress.js'
+import { shouldSkipUnavailableAutoplayTrack } from '../room/autoplay.js'
+import { RoomVoiceClient } from '../room/RoomVoiceClient.js'
+import RoomVoicePanel from '../room/RoomVoicePanel.jsx'
 
 const avatarColors = ['avatar-pink', 'avatar-blue', 'avatar-lime']
 
@@ -24,7 +27,7 @@ function trackArt(track, className = '') {
 export default function ListeningRoomPage({
   session, query, onQueryChange, sampleTrack, onLeave, onPlaybackState, onSocketReady,
   onPlaybackCommand, onTrackChange, onToggleRepeat, repeatMode = 'off', volumeLevel = 0.72, muted = false,
-  onVolumeChange, onToggleMute, onSuspendYoutube, onResumeYoutube, youtubePlayer, youtubeState, playerState, onQueueState, onRegisterDismissible,
+  onVolumeChange, onToggleMute, youtubePlayer, youtubeState, playerState, onQueueState, onRegisterDismissible,
 }) {
   const [room, setRoom] = useState(session.room)
   const [queue, setQueue] = useState([])
@@ -46,12 +49,17 @@ export default function ListeningRoomPage({
   const [activeRoomTab, setActiveRoomTab] = useState('player')
   const [playerView, setPlayerView] = useState('turntable')
   const [lyricsState, setLyricsState] = useState({ trackId: null, status: 'unavailable' })
+  const [voiceState, setVoiceState] = useState({ joined: false, joining: false, muted: false, error: '', audioBlocked: false, participants: [], remoteStreams: new Map() })
   const socketRef = useRef(null)
+  const voiceClientRef = useRef(null)
+  const unavailableSkipTokenRef = useRef(null)
   const searchInputRef = useRef(null)
   const chatEndRef = useRef(null)
-  const currentTrack = playback.currentTrack ?? tracks.find((track) => track.id === playback.currentTrackId)
-  const duration = playerState?.duration || 0
-  const currentTime = Math.min(playerState?.currentTime || 0, duration || 0)
+  const currentTrack = playback.currentTrack ?? null
+  const isHost = room.members.some((member) => member.id === session.member.id && member.role === 'owner')
+  const progress = getRoomProgressState(currentTrack, { youtubeState, audioState: playerState })
+  const duration = progress.duration
+  const currentTime = progress.currentTime
 
   useEffect(() => {
     if (currentTrack?.provider !== 'youtube' && playerView === 'video') setPlayerView('turntable')
@@ -71,21 +79,48 @@ export default function ListeningRoomPage({
 
   useEffect(() => {
     const socket = connectToRoom(session)
+    let active = true
     socketRef.current = socket
-    onSocketReady?.(socket)
-    socket.on('connect', () => { setConnectionStatus('connected'); setError('') })
-    socket.on('disconnect', () => setConnectionStatus('reconnecting'))
-    socket.on('connect_error', (connectError) => {
+    const voiceClient = new RoomVoiceClient(socket, session.member.id, setVoiceState)
+    voiceClientRef.current = voiceClient
+    onSocketReady?.(socket, session)
+    const handlers = {
+      connect: () => { if (active) { setConnectionStatus('connected'); setError('') } },
+      disconnect: () => { if (active) setConnectionStatus('reconnecting') },
+      connect_error: (connectError) => {
+        if (!active) return
       setConnectionStatus('offline')
       setError(connectError.message === 'ROOM_SESSION_INVALID' ? 'This room session expired. Leave and join the room again.' : 'Can’t reach the room server. Reconnecting…')
-    })
-    socket.on('room:state', (nextRoom) => setRoom(nextRoom))
-    socket.on('queue:state', (state) => { const nextQueue = state.queue ?? []; setQueue(nextQueue); onQueueState?.(nextQueue); setQueueLoading(false) })
-    socket.on('playback:state', (state) => { setPlayback(state); onPlaybackState?.(state) })
-    socket.on('chat:history', (state) => setMessages(state.messages ?? []))
-    socket.on('chat:message', (message) => setMessages((previous) => previous.some((item) => item.id === message.id) ? previous : [...previous, message].slice(-100)))
-    socket.on('room:closed', () => { setConnectionStatus('closed'); setError('This room has closed.') })
-    return () => { socket.disconnect(); socketRef.current = null; onSocketReady?.(null) }
+      },
+      'room:state': (nextRoom) => { if (active) setRoom(nextRoom) },
+      'queue:state': (state) => {
+        if (!active) return
+        const nextQueue = state.queue ?? []
+        setQueue(nextQueue)
+        onQueueState?.(nextQueue, session)
+        setQueueLoading(false)
+      },
+      'playback:state': (state) => {
+        if (!active) return
+        setPlayback(state)
+        onPlaybackState?.(state, session)
+      },
+      'chat:history': (state) => { if (active) setMessages(state.messages ?? []) },
+      'chat:message': (message) => {
+        if (active) setMessages((previous) => previous.some((item) => item.id === message.id) ? previous : [...previous, message].slice(-100))
+      },
+      'room:closed': () => { if (active) { setConnectionStatus('closed'); setError('This room has closed.') } },
+    }
+    for (const [event, handler] of Object.entries(handlers)) socket.on(event, handler)
+    return () => {
+      active = false
+      voiceClient.dispose()
+      if (voiceClientRef.current === voiceClient) voiceClientRef.current = null
+      for (const [event, handler] of Object.entries(handlers)) socket.off(event, handler)
+      socket.disconnect()
+      if (socketRef.current === socket) socketRef.current = null
+      onSocketReady?.(null, session)
+    }
   }, [session, onPlaybackState, onQueueState, onSocketReady])
 
   useEffect(() => {
@@ -127,6 +162,7 @@ export default function ListeningRoomPage({
   }
 
   const addSearchResult = (result, playNow = false) => {
+    if (playNow && !isHost) return
     const track = asYouTubeTrack(result)
     emitRoomAction('queue:add', { trackId: track.id, trackData: track }, (added) => {
       setSearchStatus('idle')
@@ -160,6 +196,7 @@ export default function ListeningRoomPage({
     setLeaving(true)
     setError('')
     try {
+      await voiceClientRef.current?.leave()
       await leaveRoom({ code: room.code, memberId: session.member.id, memberToken: session.memberToken })
       socketRef.current?.disconnect()
       onLeave()
@@ -174,20 +211,21 @@ export default function ListeningRoomPage({
     }
   }
 
-  const activePlayerState = currentTrack?.provider === 'youtube' ? youtubeState : playerState
-  const playerStatus = activePlayerState?.status || 'ready'
-  const youtubeDetached = currentTrack?.provider === 'youtube' && (playerView !== 'video' || activeRoomTab !== 'player')
+  const playerStatus = progress.status
   const roomIsPlaying = currentTrack?.provider === 'youtube'
     ? playerStatus === 'playing' || (playerStatus === 'loading' && Boolean(playback.isPlaying))
     : Boolean(playback.isPlaying)
   const activeLyricsState = currentTrack ? (lyricsState.trackId === currentTrack.id ? lyricsState : { status: 'loading' }) : lyricsState
 
-  const changePlayerView = (view) => {
-    if (view !== 'video' && playerView === 'video') onSuspendYoutube?.()
-    setPlayerView(view)
-  }
+  useEffect(() => { unavailableSkipTokenRef.current = null }, [playback.playbackToken])
+  useEffect(() => {
+    if (!shouldSkipUnavailableAutoplayTrack({ isHost, track: currentTrack, playback, status: playerStatus, attemptedToken: unavailableSkipTokenRef.current })) return
+    unavailableSkipTokenRef.current = playback.playbackToken
+    emitRoomAction('playback:skip', { expectedTrackId: playback.currentTrackId, expectedPlaybackToken: playback.playbackToken })
+  }, [isHost, currentTrack?.provider, playback.currentTrackIsAutoplay, playback.currentTrackId, playback.playbackToken, playerStatus])
+
+  const changePlayerView = (view) => setPlayerView(view)
   const changeRoomTab = (tab) => {
-    if (tab !== 'player' && activeRoomTab === 'player' && playerView === 'video') onSuspendYoutube?.()
     setActiveRoomTab(tab)
   }
   const handlePlayerTabKeyDown = (event, tab) => {
@@ -204,14 +242,13 @@ export default function ListeningRoomPage({
     document.getElementById(`room-tab-${nextView}`)?.focus()
   }
   const toggleRoomPlayback = () => {
-    if (youtubeDetached) {
-      onResumeYoutube?.()
-      setActiveRoomTab('player')
-      setPlayerView('video')
-      onPlaybackCommand?.({ isPlaying: true, positionMs: Math.round(currentTime * 1000) })
-      return
-    }
+    if (!isHost) return
     onPlaybackCommand?.({ isPlaying: !roomIsPlaying, positionMs: Math.round(currentTime * 1000) })
+  }
+  const toggleAutoplay = () => {
+    if (!isHost) return
+    const enabled = !playback.autoplayEnabled
+    emitRoomAction('playback:autoplay', { enabled })
   }
 
   return <main className="listening-room-page">
@@ -229,7 +266,7 @@ export default function ListeningRoomPage({
             {result.thumbnails?.default ? <img src={result.thumbnails.default} alt=""/> : <span className="room-search-result-fallback">YT</span>}
             <span className="room-search-result-copy"><b>{result.title}</b><small>{result.channelName} · YouTube</small></span>
             <button type="button" onClick={() => addSearchResult(result)} disabled={queue.length >= 50} aria-label={`Add ${result.title} to queue`}>Add</button>
-            <button type="button" className="room-search-play" onClick={() => addSearchResult(result, true)} disabled={queue.length >= 50} aria-label={`Play ${result.title}`}>Play</button>
+            <button type="button" className="room-search-play" onClick={() => addSearchResult(result, true)} disabled={!isHost || queue.length >= 50} title={isHost ? 'Play this track now' : 'Only the room host can play tracks'} aria-label={`Play ${result.title}`}>Play</button>
           </article>)}
         </div>}
       </form>
@@ -255,7 +292,7 @@ export default function ListeningRoomPage({
         </section>
 
         <section className="queue-section">
-          <div className="room-panel-heading"><div><p className="eyebrow">UP NEXT</p><h2>Shared queue</h2></div><span className="room-count">{queue.length}/50</span></div>
+          <div className="room-panel-heading"><div><p className="eyebrow">UP NEXT</p><h2>Shared queue</h2></div><div className="queue-heading-actions"><span className="room-count">{queue.length}/50</span><button type="button" className={`autoplay-toggle ${playback.autoplayEnabled ? 'is-on' : ''}`} onClick={toggleAutoplay} disabled={!isHost || connectionStatus !== 'connected'} aria-pressed={Boolean(playback.autoplayEnabled)} title={isHost ? 'Automatically suggest related YouTube tracks when the queue runs out' : 'Only the room host can change Autoplay'}><span className="autoplay-indicator" aria-hidden="true"/>{playback.autoplayEnabled ? 'Autoplay on' : 'Autoplay off'}</button></div></div>
           <button className="queue-add-music" onClick={() => { setActiveRoomTab('player'); searchInputRef.current?.focus() }}><Icon name="plus" size={15}/> Add music</button>
           {queueError && <p className="queue-error" role="status">{queueError}</p>}
           <div className="queue-current-separator"><span className="eyebrow">NOW PLAYING</span></div>
@@ -265,13 +302,13 @@ export default function ListeningRoomPage({
           <div className="queue-current-separator"><span className="eyebrow">UPCOMING TRACKS</span></div>
           <div className="queue-scroll">
             {queueLoading ? <p className="room-empty-queue">Loading shared queue…</p> : queue.length === 0 ? <div className="room-empty-panel"><b>The queue is empty</b><p>Search for music to add a video.</p></div> : <ol className="shared-queue-list">{queue.map((item, index) => {
-              const track = item.trackData ?? tracks.find((entry) => entry.id === item.trackId)
+              const track = item.trackData
               if (!track) return null
-              return <li className="shared-queue-item" key={item.itemId}>
+              return <li className={`shared-queue-item ${item.isAutoplay ? 'autoplay-suggestion' : ''}`} key={item.itemId}>
                 {trackArt(track)}
-                <span className="shared-queue-track"><b title={track.title}>{track.title}</b><small title={`${track.channelName || track.artist} · added by ${item.addedBy}`}>{track.channelName || track.artist} · {item.addedBy}</small></span>
+                <span className="shared-queue-track"><b title={track.title}>{track.title}</b><small title={`${track.channelName || track.artist} · ${item.isAutoplay ? 'Autoplay suggestion' : `added by ${item.addedBy}`}`}>{track.channelName || track.artist} · {item.isAutoplay ? 'Autoplay suggestion' : item.addedBy}</small></span>
                 <span className="queue-reorder-actions"><button className="queue-icon-button" onClick={() => emitRoomAction('queue:reorder', { itemId: item.itemId, toIndex: Math.max(0, index - 1) })} disabled={index === 0} aria-label={`Move ${track.title} up`}>↑</button><button className="queue-icon-button" onClick={() => emitRoomAction('queue:reorder', { itemId: item.itemId, toIndex: Math.min(queue.length - 1, index + 1) })} disabled={index === queue.length - 1} aria-label={`Move ${track.title} down`}>↓</button></span>
-                <button className="queue-icon-button queue-select-button" onClick={() => emitRoomAction('playback:select', { itemId: item.itemId, playImmediately: true })} aria-label={`Play ${track.title}`}>▶</button>
+                <button className="queue-icon-button queue-select-button" onClick={() => emitRoomAction('playback:select', { itemId: item.itemId, playImmediately: true })} disabled={!isHost} title={isHost ? `Play ${track.title}` : 'Only the room host can select tracks'} aria-label={`Play ${track.title}`}>▶</button>
                 <button className="queue-icon-button queue-remove-button" onClick={() => emitRoomAction('queue:remove', { itemId: item.itemId })} aria-label={`Remove ${track.title}`}>×</button>
               </li>
             })}</ol>}
@@ -280,7 +317,7 @@ export default function ListeningRoomPage({
       </aside>
 
       <section className={`room-panel room-player-column ${activeRoomTab === 'player' ? 'mobile-active' : ''}`}>
-        <div className="room-panel-heading"><div><p className="eyebrow">ON THE TURNTABLE</p><h2>Now playing</h2></div><span className={`playback-status playback-${playerStatus}`}>{playerStatus === 'playing' ? 'Playing' : playerStatus === 'loading' ? 'Buffering' : playerStatus === 'error' ? 'Unavailable' : youtubeDetached ? 'Paused in this view' : playback.isPlaying ? 'Waiting for player' : currentTrack ? 'Paused' : 'Ready when you are'}</span></div>
+        <div className="room-panel-heading"><div><p className="eyebrow">ON THE TURNTABLE</p><h2>Now playing</h2></div><span className={`playback-status playback-${playerStatus}`}>{playerStatus === 'playing' ? 'Playing' : playerStatus === 'loading' ? 'Buffering' : playerStatus === 'error' ? 'Unavailable' : playback.isPlaying ? 'Waiting for player' : currentTrack ? 'Paused' : 'Ready when you are'}</span></div>
         <div className="room-player-view-tabs" role="tablist" aria-label="Player views">
           <button type="button" role="tab" id="room-tab-turntable" aria-selected={playerView === 'turntable'} aria-controls="room-panel-turntable" tabIndex={playerView === 'turntable' ? 0 : -1} className={playerView === 'turntable' ? 'active' : ''} onKeyDown={(event) => handlePlayerTabKeyDown(event, 'turntable')} onClick={() => changePlayerView('turntable')}>Turntable</button>
           <button type="button" role="tab" id="room-tab-lyrics" aria-selected={playerView === 'lyrics'} aria-controls="room-panel-lyrics" tabIndex={playerView === 'lyrics' ? 0 : -1} className={playerView === 'lyrics' ? 'active' : ''} onKeyDown={(event) => handlePlayerTabKeyDown(event, 'lyrics')} onClick={() => changePlayerView('lyrics')}>Lyrics</button>
@@ -290,7 +327,7 @@ export default function ListeningRoomPage({
           <div className="room-view-panel room-turntable-panel" id="room-panel-turntable" role="tabpanel" aria-labelledby="room-tab-turntable" hidden={playerView !== 'turntable'}>
             <div className={`room-vinyl-stage ${currentTrack && playerStatus === 'playing' ? 'record-turning' : ''}`} aria-hidden="true"><div className="room-vinyl"><span className="vinyl-label">{currentTrack ? trackArt(currentTrack, 'vinyl-cover') : <b>J</b>}<small>JAMMY · SIDE A</small></span></div><span className="vinyl-tonearm"/></div>
             {!currentTrack && <p className="room-player-empty">Your turntable is ready for a first track.</p>}
-            {currentTrack?.provider === 'youtube' && <p className="room-player-policy-note">YouTube playback pauses in Turntable and Lyrics views. Select Video to resume the official player.</p>}
+            {currentTrack?.provider === 'youtube' && <p className="room-player-policy-note">YouTube playback continues while you browse Turntable and Lyrics. Select Video to view the official player.</p>}
           </div>
           <div className="room-view-panel room-lyrics-panel" id="room-panel-lyrics" role="tabpanel" aria-labelledby="room-tab-lyrics" hidden={playerView !== 'lyrics'}>
             <div className="room-lyrics-heading"><h3>{currentTrack?.title || 'Lyrics'}</h3><p>{currentTrack ? currentTrack.channelName || currentTrack.artist : 'Select a track from the shared queue.'}</p></div>
@@ -302,15 +339,15 @@ export default function ListeningRoomPage({
             </div>
           </div>
           <div className="room-view-panel room-video-panel" id="room-panel-video" role="tabpanel" aria-labelledby="room-tab-video" hidden={playerView !== 'video'}>
-            {playerView === 'video' && currentTrack?.provider === 'youtube' && activeRoomTab === 'player' ? <div className="room-video-shell">{youtubePlayer}</div> : <p className="room-player-empty">Select a YouTube video to use Video view.</p>}
+            {currentTrack?.provider === 'youtube' ? <div className="room-video-shell">{youtubePlayer}</div> : <p className="room-player-empty">Select a YouTube video to use Video view.</p>}
           </div>
         </div>
         {playerView !== 'lyrics' && <div className="room-track-heading">{currentTrack ? <><h3 title={currentTrack.title}>{currentTrack.title}</h3><p>{currentTrack.channelName || currentTrack.artist} <span>·</span> {currentTrack.provider === 'youtube' ? 'YouTube' : currentTrack.album}</p></> : <><h3>Choose the first track</h3><p>Search above or select a track from the shared queue.</p></>}</div>}
         <div className="room-player-controls">
-          <div className="room-transport-controls"><button className="icon-button" disabled title="Previous track is not supported by the shared queue yet" aria-label="Previous track unavailable"><Icon name="previous" size={18}/></button><button className="play-button" onClick={toggleRoomPlayback} disabled={!currentTrack} aria-label={youtubeDetached ? 'Open Video view to resume YouTube playback' : roomIsPlaying ? 'Pause shared playback' : 'Play shared playback'}><Icon name={youtubeDetached || !roomIsPlaying ? 'play' : 'pause'} size={17}/></button><button className="icon-button" onClick={() => onTrackChange?.(1)} disabled={!currentTrack} title="Next queued track" aria-label="Next queued track"><Icon name="next" size={18}/></button><button className={`icon-button repeat-control repeat-${repeatMode}`} onClick={onToggleRepeat} aria-label={`${repeatMode === 'all' ? 'Repeat All' : repeatMode === 'one' ? 'Repeat One' : 'Repeat Off'} (R)`} aria-pressed={repeatMode !== 'off'} title={`Cycle repeat mode (R): ${repeatMode === 'all' ? 'Repeat All' : repeatMode === 'one' ? 'Repeat One' : 'Repeat Off'}`}><Icon name="repeat" size={17}/>{repeatMode === 'one' && <span aria-hidden="true">1</span>}</button></div>
-          <div className="room-playback-seek"><div><span>{formatTime(currentTime)}</span><span>{duration ? formatTime(duration) : '--:--'}</span></div><input aria-label="Shared playback position" type="range" min="0" max={duration || 1} step="1" value={Math.min(currentTime, duration) || 0} disabled={!currentTrack || !duration} onChange={(event) => onPlaybackCommand?.({ isPlaying: playback.isPlaying, positionMs: Number(event.target.value) * 1000 })}/></div>
+        <div className="room-transport-controls"><button className="icon-button" disabled title="Previous track is not supported by the shared queue yet" aria-label="Previous track unavailable"><Icon name="previous" size={18}/></button><button className="play-button" onClick={toggleRoomPlayback} disabled={!isHost || !currentTrack} title={isHost ? undefined : 'Only the room host can control playback'} aria-label={roomIsPlaying ? 'Pause shared playback' : 'Play shared playback'}><Icon name={roomIsPlaying ? 'pause' : 'play'} size={17}/></button><button className="icon-button" onClick={() => onTrackChange?.(1)} disabled={!isHost || !currentTrack} title={isHost ? 'Next queued track' : 'Only the room host can control playback'} aria-label="Next queued track"><Icon name="next" size={18}/></button><button className={`icon-button repeat-control repeat-${repeatMode}`} onClick={onToggleRepeat} disabled={!isHost} aria-label={`${repeatMode === 'all' ? 'Repeat All' : repeatMode === 'one' ? 'Repeat One' : 'Repeat Off'} (R)`} aria-pressed={repeatMode !== 'off'} title={isHost ? `Cycle repeat mode (R): ${repeatMode === 'all' ? 'Repeat All' : repeatMode === 'one' ? 'Repeat One' : 'Repeat Off'}` : 'Only the room host can change playback settings'}><Icon name="repeat" size={17}/>{repeatMode === 'one' && <span aria-hidden="true">1</span>}</button></div>
+          <div className="room-playback-seek"><div><span>{formatTime(currentTime)}</span><span>{duration ? formatTime(duration) : '--:--'}</span></div><input aria-label="Shared playback position" type="range" min="0" max={duration || 1} step="1" value={Math.min(currentTime, duration) || 0} disabled={!isHost || !currentTrack || !duration} title={isHost ? 'Seek shared playback' : 'Only the room host can seek'} onChange={(event) => onPlaybackCommand?.({ isPlaying: playback.isPlaying, positionMs: Number(event.target.value) * 1000 })}/></div>
         </div>
-        <div className="room-volume-control"><button type="button" className="icon-button" onClick={onToggleMute} disabled={youtubeDetached} aria-label={muted ? 'Unmute local playback' : 'Mute local playback'} aria-pressed={muted}><Icon name={muted ? 'volumeMuted' : 'volume'} size={17}/></button><input aria-label="Local playback volume" type="range" min="0" max="100" step="1" value={Math.round(volumeLevel * 100)} disabled={youtubeDetached} onChange={(event) => onVolumeChange?.(Number(event.target.value) / 100)}/></div>
+        <div className="room-volume-control"><button type="button" className="icon-button" onClick={onToggleMute} aria-label={muted ? 'Unmute local playback' : 'Mute local playback'} aria-pressed={muted}><Icon name={muted ? 'volumeMuted' : 'volume'} size={17}/></button><input aria-label="Local playback volume" type="range" min="0" max="100" step="1" value={Math.round(volumeLevel * 100)} onChange={(event) => onVolumeChange?.(Number(event.target.value) / 100)}/></div>
         {currentTrack?.provider !== 'youtube' && <div className="room-player-empty">{currentTrack ? 'This selection uses Jammy’s local audio player.' : 'Your turntable is ready for a first track.'}</div>}
         {youtubeState?.error && <p className="room-player-error" role="status">{youtubeState.error}</p>}
         <p className="room-playback-note">Audio plays separately for each listener. Browser autoplay and video availability may vary.</p>
@@ -331,9 +368,10 @@ export default function ListeningRoomPage({
         </div>
         <form className="room-chat-form" onSubmit={sendMessage}><label className="sr-only" htmlFor="room-chat-input">Message the room</label><input id="room-chat-input" value={chatText} onChange={(event) => setChatText(event.target.value)} maxLength={500} placeholder="Message the room…" disabled={connectionStatus !== 'connected' || chatSending}/><button type="submit" aria-label="Send message" disabled={!chatText.trim() || connectionStatus !== 'connected' || chatSending}><Icon name="arrow" size={17}/></button></form>
         {chatError && <p className="chat-error" role="status">{chatError}</p>}
-        <div className="voice-placeholder"><span><Icon name="volume" size={15}/> Voice chat</span><small>Not available yet</small></div>
       </aside>
     </div>
+
+    <RoomVoicePanel voiceState={voiceState} currentMemberId={session.member.id} members={room.members} voiceClientRef={voiceClientRef} disabled={connectionStatus !== 'connected' || leaving}/>
 
     <footer className="room-footer"><span><i/> {room.members.filter((member) => member.online).length} listeners online · {room.code}</span><span>Playback is best-effort and may differ between browsers.</span></footer>
     <button className="room-leave-mobile" onClick={handleLeave} disabled={leaving}>{leaving ? 'Leaving…' : 'Leave room'}</button>

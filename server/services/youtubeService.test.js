@@ -88,7 +88,7 @@ test('signed search results are tamper-resistant, expire, and can enter the room
   } })
   const result = (await service.search('song'))[0]
   assert.equal(service.verifySelection({ ...result, title: 'Changed title' }), false)
-  const roomService = { authenticate: async () => ({ code: 'ABC123', displayName: 'Tester' }) }
+  const roomService = { authenticate: async () => ({ code: 'ABC123', memberId: 'tester', displayName: 'Tester', role: 'owner' }) }
   const queue = new QueueService({ roomService, youtubeService: service })
   const added = await queue.add({}, { trackId: `youtube:${result.videoId}`, trackData: result })
   assert.equal(added.queue[0].trackData.title, 'A music video')

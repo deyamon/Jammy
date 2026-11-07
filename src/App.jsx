@@ -1,47 +1,71 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Icon from './components/Icon.jsx'
 import Sidebar from './components/Sidebar.jsx'
-import TrackCard from './components/TrackCard.jsx'
-import MixCard from './components/MixCard.jsx'
 import MusicPlayer from './components/MusicPlayer.jsx'
 import RoomDialog from './components/RoomDialog.jsx'
 import SearchPage from './pages/SearchPage.jsx'
+import SearchBox from './components/SearchBox.jsx'
 import LibraryPage from './pages/LibraryPage.jsx'
+import AuthPage from './pages/AuthPage.jsx'
+import ProfilePage from './pages/ProfilePage.jsx'
 import ListeningRoomPage from './pages/ListeningRoomPage.jsx'
+import HomeMusicPanel from './pages/HomeMusicPanel.jsx'
 import YoutubeEmbed from './playback/YoutubeEmbed.jsx'
 import NowPlayingOverlay from './components/NowPlayingOverlay.jsx'
-import { friends, mixes, tracks } from './data.js'
 import { useAudioEngine } from './playback/useAudioEngine.js'
 import { PlaybackController } from './playback/PlaybackController.js'
+import { createPlaybackSnapshot, isCurrentRoomSession, resolveActiveTrack } from './playback/playbackSnapshot.js'
 import { attachKeyboardShortcuts } from './keyboard/shortcuts.js'
 import { getTrackEndAction, nextRepeatMode } from './playback/repeat.js'
+import { loadSoloYouTubeTrack } from './playback/soloYouTubePlayback.js'
 import { acceptYouTubeNotice, hasYouTubeConsent } from './services/youtubeConsent.js'
+import { getAuthSession, logoutAccount } from './services/authApi.js'
+import { recordJammyPlayback } from './services/musicApi.js'
+import { accountStateAfterLogout, accountStateAfterSessionError, accountStateFromSession, authenticatedAccountState, guestAccountState } from './account/accountState.js'
+import { readRecentSearches, rememberRecentSearch, removeRecentSearch } from './search/recentSearches.js'
+
+function browserLocalStorage() {
+  try { return window.localStorage } catch { return null }
+}
+
+function getRoomInviteCode() {
+  const params = new URLSearchParams(window.location.search)
+  const code = params.get('room') ?? params.get('roomCode') ?? ''
+  return /^[a-z0-9]{6}$/i.test(code) ? code.toUpperCase() : ''
+}
 
 function App() {
   const [activeNav, setActiveNav] = useState('Home')
+  const [account, setAccount] = useState(() => guestAccountState('loading'))
   const [libraryTab, setLibraryTab] = useState('Playlists')
-  const [currentTrack, setCurrentTrack] = useState(tracks[0])
+  const [standaloneTrack, setStandaloneTrack] = useState(null)
   const playbackControllerRef = useRef(null)
-  if (!playbackControllerRef.current) playbackControllerRef.current = new PlaybackController(tracks[0])
+  if (!playbackControllerRef.current) playbackControllerRef.current = new PlaybackController(standaloneTrack)
   const playbackController = playbackControllerRef.current
   const [playbackState, setPlaybackState] = useState(() => playbackController.getState())
   const [query, setQuery] = useState('')
+  const [recentSearches, setRecentSearches] = useState([])
   const [toast, setToast] = useState('')
   const [roomDialogMode, setRoomDialogMode] = useState(null)
   const [roomSession, setRoomSession] = useState(null)
+  const [roomInviteCode, setRoomInviteCode] = useState(getRoomInviteCode)
   const [roomPlayback, setRoomPlayback] = useState(null)
   const [roomQueue, setRoomQueue] = useState([])
+  const [standaloneYoutubeState, setStandaloneYoutubeState] = useState({ status: 'idle', currentTime: 0, duration: 0, volume: 72, muted: false, error: '' })
+  const [roomYoutubeState, setRoomYoutubeState] = useState({ status: 'idle', currentTime: 0, duration: 0, volume: 72, muted: false, error: '' })
   const [repeatMode, setRepeatMode] = useState('off')
   const [nowPlayingOpen, setNowPlayingOpen] = useState(false)
   const [expandedTab, setExpandedTab] = useState('player')
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [youtubeAutoplayRequested, setYoutubeAutoplayRequested] = useState(false)
-  const [youtubeState, setYoutubeState] = useState({ status: 'idle', currentTime: 0, duration: 0, volume: 72, muted: false, error: '' })
   const [youtubeConsent, setYoutubeConsent] = useState(() => hasYouTubeConsent())
+  const [accountBusy, setAccountBusy] = useState(false)
   const roomPlaybackRef = useRef(null)
   const roomSocketRef = useRef(null)
-  const youtubeRef = useRef(null)
-  const suspendedRoomVideoRef = useRef(null)
+  const roomSessionRef = useRef(null)
+  const standaloneSnapshotRef = useRef(null)
+  const standaloneYoutubeRef = useRef(null)
+  const roomYoutubeRef = useRef(null)
   const pendingRoomTrackRef = useRef(null)
   const searchInputRef = useRef(null)
   const repeatModeRef = useRef('off')
@@ -50,10 +74,114 @@ function App() {
   const dismissiblesRef = useRef([])
   const shortcutActionsRef = useRef(null)
   const providerActionsRef = useRef({})
+  const accountRevisionRef = useRef(0)
+  const roomInviteOpenedRef = useRef(false)
+  const recordedPlaybackRef = useRef(false)
+  const currentTrack = resolveActiveTrack({ roomSession, roomPlayback, standaloneTrack })
+  const youtubeState = roomSession ? roomYoutubeState : standaloneYoutubeState
   const notify = (message) => { setToast(message); window.setTimeout(() => setToast(''), 2600) }
+  const accountUserId = account.status === 'authenticated' ? account.user.id : ''
+
+  useEffect(() => {
+    setRecentSearches(accountUserId ? readRecentSearches(browserLocalStorage(), accountUserId) : [])
+  }, [accountUserId])
+
+  const rememberSearch = useCallback((value) => {
+    if (accountUserId) setRecentSearches(rememberRecentSearch(browserLocalStorage(), accountUserId, value))
+  }, [accountUserId])
+
+  const forgetSearch = useCallback((value) => {
+    if (accountUserId) setRecentSearches(removeRecentSearch(browserLocalStorage(), accountUserId, value))
+  }, [accountUserId])
   roomPlaybackRef.current = roomPlayback
   const activeRepeatMode = roomSession ? roomPlayback?.repeatMode ?? 'off' : repeatMode
   repeatModeRef.current = activeRepeatMode
+
+  const restoreAccountSession = useCallback(async () => {
+    const revision = ++accountRevisionRef.current
+    setAccount(guestAccountState('loading'))
+    try {
+      const result = await getAuthSession()
+      if (revision === accountRevisionRef.current) setAccount(accountStateFromSession(result))
+    } catch (error) {
+      if (revision === accountRevisionRef.current) setAccount(accountStateAfterSessionError(error))
+    }
+  }, [])
+
+  const refreshAccountSession = useCallback(async () => {
+    const revision = accountRevisionRef.current
+    try {
+      const result = await getAuthSession()
+      if (revision === accountRevisionRef.current) setAccount(accountStateFromSession(result))
+    } catch (error) {
+      if (revision === accountRevisionRef.current) setAccount(accountStateAfterSessionError(error))
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    const revision = accountRevisionRef.current
+    getAuthSession().then((result) => {
+      if (active && revision === accountRevisionRef.current) setAccount(accountStateFromSession(result))
+    }).catch((error) => {
+      if (active && revision === accountRevisionRef.current) setAccount(accountStateAfterSessionError(error))
+    })
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') void refreshAccountSession()
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => document.removeEventListener('visibilitychange', handleVisibility)
+  }, [refreshAccountSession])
+
+  useEffect(() => {
+    if (account.status !== 'authenticated' || !roomInviteCode || roomInviteOpenedRef.current) return
+    roomInviteOpenedRef.current = true
+    setActiveNav('Home')
+    setRoomDialogMode('join')
+  }, [account.status, roomInviteCode])
+
+  useEffect(() => {
+    const playing = Boolean(currentTrack?.provider === 'youtube'
+      && youtubeState.status === 'playing'
+      && (!roomSession || roomPlayback?.isPlaying))
+    if (!playing) { recordedPlaybackRef.current = false; return }
+    if (recordedPlaybackRef.current || account.status !== 'authenticated') return
+    const eventId = globalThis.crypto?.randomUUID?.()
+    if (!eventId) return
+    recordedPlaybackRef.current = true
+    void recordJammyPlayback({ eventId, videoId: currentTrack.videoId, title: currentTrack.title, channelName: currentTrack.channelName || currentTrack.artist || '', source: roomSession ? 'room' : 'standalone' }).catch(() => {})
+  }, [account.status, currentTrack?.id, currentTrack?.provider, currentTrack?.videoId, currentTrack?.title, currentTrack?.channelName, currentTrack?.artist, roomSession, roomPlayback?.isPlaying, youtubeState.status])
+
+  const handleAuthenticated = (payload) => {
+    try {
+      accountRevisionRef.current += 1
+      setAccount(authenticatedAccountState(payload))
+      setActiveNav('Home')
+    } catch (error) {
+      setAccount(guestAccountState('error', error.message))
+    }
+  }
+  const handleLogout = async () => {
+    if (accountBusy) return
+    accountRevisionRef.current += 1
+    setAccountBusy(true)
+    try {
+      await logoutAccount(account.csrfToken)
+      accountRevisionRef.current += 1
+      setAccount(accountStateAfterLogout())
+      setActiveNav('Home')
+      notify('You’re logged out.')
+    } catch (error) {
+      await refreshAccountSession()
+      notify(error.message || 'Jammy could not log you out. Try again.')
+    } finally {
+      setAccountBusy(false)
+    }
+  }
 
   const registerDismissible = useCallback((id, dismiss) => {
     dismissiblesRef.current = dismissiblesRef.current.filter((entry) => entry.id !== id)
@@ -66,11 +194,9 @@ function App() {
       if (playback?.currentTrackId && playback.playbackToken) roomSocketRef.current?.emit('playback:next', { expectedTrackId: playback.currentTrackId, expectedPlaybackToken: playback.playbackToken })
       return
     }
-    const index = tracks.findIndex((track) => track.id === currentTrack.id)
-    const action = getTrackEndAction(repeatModeRef.current, index, tracks.length)
+    const action = getTrackEndAction(repeatModeRef.current, 0, standaloneTrack ? 1 : 0)
     if (action.type === 'replay') { restartAudioRef.current(); return }
-    if (action.type === 'select') { void playbackController.loadTrack(tracks[action.index], { autoplay: true, openPlayer: false }) }
-  }, [currentTrack.id, roomSession, playbackController])
+  }, [standaloneTrack?.id, roomSession, playbackController])
   const audio = useAudioEngine({ track: currentTrack, roomActive: Boolean(roomSession), sharedPlayback: roomPlayback, onEnded: handleAudioEnded })
   providerActionsRef.current.audioPlay = audio.play
   providerActionsRef.current.audioPause = audio.pause
@@ -80,21 +206,28 @@ function App() {
   providerActionsRef.current.loadTrack = (track, options = {}) => {
     if (roomSession) return false
     if (track.provider === 'youtube') {
-      if (track.id !== currentTrack.id) setYoutubeState((previous) => ({ ...previous, status: 'loading', currentTime: 0, duration: 0, error: '' }))
-      setCurrentTrack(track)
-      setYoutubeAutoplayRequested(Boolean(options.autoplay))
-      if (options.openPlayer !== false) openNowPlaying('player')
-      if (track.id === currentTrack.id && youtubeRef.current?.canControl?.() && options.autoplay) youtubeRef.current.play()
-      return true
+      const result = loadSoloYouTubeTrack(track, standaloneTrack, options, {
+        setTrack: setStandaloneTrack,
+        setAutoplayRequested: setYoutubeAutoplayRequested,
+        openPlayer: () => openNowPlaying('player'),
+        player: standaloneYoutubeRef.current,
+      })
+      if (!result.ok) {
+        setStandaloneYoutubeState((previous) => ({ ...previous, status: 'error', error: result.error }))
+        notify(result.error)
+        throw new Error(result.error)
+      }
+      if (result.changed) setStandaloneYoutubeState((previous) => ({ ...previous, status: 'loading', currentTime: 0, duration: 0, error: '' }))
+      return result.ok
     }
-    if (track.id === currentTrack.id) { if (options.autoplay) void audio.play(); return true }
+    if (track.id === standaloneTrack?.id) { if (options.autoplay) void audio.play(); return true }
     if (options.autoplay) audio.requestAutoplayOnSelection()
-    setCurrentTrack(track)
+    setStandaloneTrack(track)
     return true
   }
-  providerActionsRef.current.currentState = () => currentTrack.provider === 'youtube'
-    ? { ...youtubeState, volume: (youtubeState.volume ?? 72) / 100, currentTime: youtubeRef.current?.getCurrentTime?.() ?? youtubeState.currentTime }
-    : { ...audio.state, currentTime: audio.audioRef.current?.currentTime ?? audio.state.currentTime }
+  providerActionsRef.current.currentState = () => standaloneTrack?.provider === 'youtube'
+    ? { ...standaloneYoutubeState, volume: (standaloneYoutubeState.volume ?? 72) / 100, currentTime: standaloneYoutubeRef.current?.getCurrentTime?.() ?? standaloneYoutubeState.currentTime }
+    : { ...playbackState, currentTime: audio.audioRef.current?.currentTime ?? playbackState.currentTime }
   useEffect(() => playbackController.subscribe(setPlaybackState), [playbackController])
   useEffect(() => {
     const audioAdapter = {
@@ -108,15 +241,14 @@ function App() {
       getCurrentState: () => providerActionsRef.current.currentState(),
     }
     const youtubeAdapter = {
-      capabilities: { loadTrack: true, play: true, pause: true, seek: true, setVolume: true, toggleMute: true, applyRoomCommand: true },
+      capabilities: { loadTrack: true, play: true, pause: true, seek: true, setVolume: true, toggleMute: true },
       loadTrack: (track, options) => providerActionsRef.current.loadTrack(track, options),
-      play: () => youtubeRef.current?.play?.() ?? false,
-      pause: () => youtubeRef.current?.pause?.() ?? false,
-      seek: (position) => youtubeRef.current?.seek?.(position) ?? false,
-      applyRoomCommand: (command) => youtubeRef.current?.applyRoomCommand?.(command) ?? false,
-      setVolume: (volume) => youtubeRef.current?.setVolume?.(volume * 100) ?? false,
+      play: () => standaloneYoutubeRef.current?.playFromUserGesture?.() ?? standaloneYoutubeRef.current?.play?.() ?? false,
+      pause: () => standaloneYoutubeRef.current?.pause?.() ?? false,
+      seek: (position) => standaloneYoutubeRef.current?.seek?.(position) ?? false,
+      setVolume: (volume) => standaloneYoutubeRef.current?.setVolume?.(volume * 100) ?? false,
       toggleMute: () => {
-        const player = youtubeRef.current
+        const player = standaloneYoutubeRef.current
         if (!player?.canControl?.()) return false
         if (player.isMuted()) player.unMute()
         else player.mute()
@@ -128,9 +260,11 @@ function App() {
     const unregisterYouTube = playbackController.registerProvider('youtube', youtubeAdapter)
     return () => { unregisterAudio(); unregisterYouTube() }
   }, [playbackController])
-  useEffect(() => { playbackController.setTrack(currentTrack) }, [playbackController, currentTrack])
-  useEffect(() => { playbackController.setRepeatMode(activeRepeatMode) }, [playbackController, activeRepeatMode])
-  useEffect(() => { playbackController.reportProviderState('audio', currentTrack.id, audio.state) }, [playbackController, currentTrack.id, audio.state])
+  useEffect(() => { playbackController.setTrack(standaloneTrack) }, [playbackController, standaloneTrack])
+  useEffect(() => { playbackController.setRepeatMode(repeatMode) }, [playbackController, repeatMode])
+  useEffect(() => {
+    if (!roomSession && standaloneTrack?.id) playbackController.reportProviderState('audio', standaloneTrack.id, audio.state)
+  }, [playbackController, standaloneTrack?.id, audio.state, roomSession])
   autoplayRequestRef.current = audio.requestAutoplayOnSelection
   restartAudioRef.current = () => {
     const element = audio.audioRef.current
@@ -148,42 +282,35 @@ function App() {
       })
       return
     }
-    const currentIndex = tracks.findIndex((track) => track.id === currentTrack.id)
-    if (currentIndex < 0) { notify('Track navigation is unavailable for this standalone YouTube video.'); return }
-    let nextIndex = currentIndex + direction
-    if (nextIndex < 0 || nextIndex >= tracks.length) {
-      if (activeRepeatMode !== 'all') { notify(direction > 0 ? 'You reached the end of Jammy’s listening list.' : 'You are at the first track.'); return }
-      nextIndex = (nextIndex + tracks.length) % tracks.length
-    }
-    void playbackController.loadTrack(tracks[nextIndex], { autoplay: true, openPlayer: false })
+    if (!standaloneTrack) { notify('Choose a YouTube video before using track navigation.'); return }
+    if (direction < 0 || activeRepeatMode !== 'all') { notify(direction < 0 ? 'Previous track is not available for a standalone YouTube video.' : 'There are no more tracks in your listening history.'); return }
+    void playbackController.loadTrack(standaloneTrack, { autoplay: true, openPlayer: false })
   }
   const playTrack = (track) => { if (!roomSession) void playbackController.loadTrack(track, { autoplay: true }) }
-  const onRoomPlaybackState = useCallback((nextPlayback) => {
+  const onRoomPlaybackState = useCallback((nextPlayback, sourceSession) => {
+    if (!isCurrentRoomSession(roomSessionRef.current, sourceSession)) return
+    if (nextPlayback.currentTrackId !== roomPlaybackRef.current?.currentTrackId) {
+      setRoomYoutubeState((previous) => ({ ...previous, status: 'loading', currentTime: 0, duration: 0, error: '' }))
+    }
     setRoomPlayback(nextPlayback)
     roomPlaybackRef.current = nextPlayback
-    const selectedTrack = nextPlayback.currentTrack ?? tracks.find((track) => track.id === nextPlayback.currentTrackId)
-    if (selectedTrack) setCurrentTrack(selectedTrack)
   }, [])
-  const suspendRoomYoutube = () => {
-    const snapshot = youtubeRef.current?.suspend?.()
-    if (!snapshot || currentTrack?.provider !== 'youtube') return
-    suspendedRoomVideoRef.current = {
-      trackId: currentTrack.id,
-      currentTime: snapshot.currentTime,
-      isPlaying: snapshot.isPlaying,
-      updatedAt: roomPlaybackRef.current?.updatedAt,
+  const onRoomQueueState = useCallback((nextQueue, sourceSession) => {
+    if (isCurrentRoomSession(roomSessionRef.current, sourceSession)) setRoomQueue(nextQueue)
+  }, [])
+  const onRoomSocketReady = useCallback((socket, sourceSession) => {
+    if (!isCurrentRoomSession(roomSessionRef.current, sourceSession)) {
+      socket?.disconnect()
+      return
     }
-    setYoutubeState((previous) => ({ ...previous, ...snapshot, status: 'paused', error: '' }))
-  }
-  const resumeRoomYoutube = () => { suspendedRoomVideoRef.current = null }
-  const onRoomSocketReady = useCallback((socket) => {
     roomSocketRef.current = socket
     if (!socket) return
     const addPending = () => {
       const track = pendingRoomTrackRef.current
-      if (!track || !socket.connected) return
+      if (!track || !socket.connected || !isCurrentRoomSession(roomSessionRef.current, sourceSession)) return
       pendingRoomTrackRef.current = null
       socket.emit('queue:add', { trackId: track.id, trackData: track }, (result) => {
+        if (!isCurrentRoomSession(roomSessionRef.current, sourceSession)) return
         if (!result?.ok) notify(result?.error || 'The video could not be added to the room queue.')
         else notify('YouTube video added to the room queue.')
       })
@@ -192,37 +319,46 @@ function App() {
     else socket.once('connect', addPending)
   }, [])
   const handleRoomPlaybackCommand = useCallback((payload) => {
+    const sourceSession = roomSessionRef.current
     const socket = roomSocketRef.current
-    if (!socket?.connected) { notify('Reconnect to the room before changing shared playback.'); return }
-    socket.emit('playback:update', payload, (result) => {
+    if (!sourceSession || !socket?.connected) { notify('Reconnect to the room before changing shared playback.'); return }
+    const currentPlayback = roomPlaybackRef.current
+    if (!currentPlayback?.currentTrackId || !currentPlayback.playbackToken) { notify('Wait for the room playback state to sync before changing playback.'); return }
+    const command = {
+      ...payload,
+      expectedTrackId: currentPlayback.currentTrackId,
+      expectedPlaybackToken: currentPlayback.playbackToken,
+    }
+    socket.emit('playback:update', command, (result) => {
+      if (!isCurrentRoomSession(roomSessionRef.current, sourceSession)) return
       if (!result?.ok) {
         notify(result?.error || 'The room playback command could not be applied.')
         const previous = roomPlaybackRef.current
-        if (currentTrack.provider === 'youtube') {
-          if (previous) void playbackController.command('applyRoomCommand', previous)
+        if (currentTrack?.provider === 'youtube') {
+          if (previous) roomYoutubeRef.current?.applyRoomCommand?.(previous)
         } else {
-          if (previous && Number.isFinite(previous.positionMs)) void playbackController.command('seek', previous.positionMs / 1000)
-          if (previous?.isPlaying) void playbackController.command('play')
-          else void playbackController.command('pause')
+          if (previous && Number.isFinite(previous.positionMs)) audio.seek(previous.positionMs / 1000)
+          if (previous?.isPlaying) void audio.play()
+          else audio.pause()
         }
       }
     })
     // Start directly from the user gesture, then reconcile to the server's ack/state.
-    if (currentTrack.provider === 'youtube') {
-      void playbackController.command('applyRoomCommand', payload)
+    if (currentTrack?.provider === 'youtube') {
+      roomYoutubeRef.current?.applyRoomCommand?.(command)
     } else {
-      if (Number.isFinite(payload.positionMs)) void playbackController.command('seek', payload.positionMs / 1000)
-      if (payload.isPlaying) void playbackController.command('play')
-      else void playbackController.command('pause')
+      if (Number.isFinite(command.positionMs)) audio.seek(command.positionMs / 1000)
+      if (command.isPlaying) void audio.play()
+      else audio.pause()
     }
-  }, [currentTrack.provider, playbackController])
+  }, [currentTrack?.provider, audio.play, audio.pause, audio.seek])
   const handlePlayerToggle = () => {
     if (roomSession) {
       if (!roomPlayback?.currentTrackId) { notify('Select a track from the shared room queue first.'); return }
-      const state = playbackState
+      const state = currentTrack?.provider === 'youtube' ? roomYoutubeState : audio.state
       handleRoomPlaybackCommand({ isPlaying: state.status !== 'playing', positionMs: Math.round(state.currentTime * 1000) })
-    } else if (currentTrack.provider === 'youtube') {
-      if (!youtubeRef.current?.canControl?.()) {
+    } else if (currentTrack?.provider === 'youtube') {
+      if (!standaloneYoutubeRef.current?.canControl?.()) {
         setYoutubeAutoplayRequested(true)
         openNowPlaying('player')
       } else if (playbackState.status === 'playing') void playbackController.command('pause')
@@ -231,16 +367,16 @@ function App() {
     else void playbackController.command('play')
   }
   const handlePlayerSeek = (seconds) => {
-    const playerState = currentTrack.provider === 'youtube' ? youtubeState : audio.state
+    const playerState = currentTrack?.provider === 'youtube' ? youtubeState : audio.state
     if (!Number.isFinite(playerState.duration) || playerState.duration <= 0) {
       notify('Seeking is unavailable until this player reports a duration.')
       return
     }
     if (roomSession) handleRoomPlaybackCommand({ isPlaying: Boolean(roomPlayback?.isPlaying), positionMs: Math.round(seconds * 1000) })
-    else if (currentTrack.provider === 'youtube') {
-      if (youtubeRef.current?.canControl?.()) void playbackController.command('seek', seconds)
+    else if (currentTrack?.provider === 'youtube') {
+      if (standaloneYoutubeRef.current?.canControl?.()) void playbackController.command('seek', seconds)
       else {
-        setYoutubeState((previous) => ({ ...previous, currentTime: seconds }))
+        setStandaloneYoutubeState((previous) => ({ ...previous, currentTime: seconds }))
         openNowPlaying('player')
       }
     }
@@ -259,25 +395,31 @@ function App() {
     setRepeatMode(next)
   }
 
-  const currentVolume = currentTrack.provider === 'youtube'
+  const currentVolume = currentTrack?.provider === 'youtube'
     ? (youtubeState.volume ?? 72) / 100
     : audio.state.volume
-  const currentMuted = currentTrack.provider === 'youtube' ? Boolean(youtubeState.muted) : audio.state.muted
+  const currentMuted = currentTrack?.provider === 'youtube' ? Boolean(youtubeState.muted) : audio.state.muted
   const changeVolume = (value) => {
-    if (currentTrack.provider !== 'youtube') { void playbackController.command('setVolume', value); return }
-    if (!youtubeRef.current?.canControl?.()) { notify('YouTube volume controls are available when the player is ready.'); return }
-    void playbackController.command('setVolume', value)
-    setYoutubeState((previous) => ({ ...previous, volume: value * 100 }))
+    if (currentTrack?.provider !== 'youtube') { void playbackController.command('setVolume', value); return }
+    const player = roomSession ? roomYoutubeRef.current : standaloneYoutubeRef.current
+    if (!player?.canControl?.()) { notify('YouTube volume controls are available when the player is ready.'); return }
+    if (roomSession) player.setVolume(value * 100)
+    else void playbackController.command('setVolume', value)
+    const setState = roomSession ? setRoomYoutubeState : setStandaloneYoutubeState
+    setState((previous) => ({ ...previous, volume: value * 100 }))
   }
   const toggleMute = () => {
-    if (currentTrack.provider !== 'youtube') { void playbackController.command('toggleMute'); return }
-    if (!youtubeRef.current?.canControl?.()) { notify('YouTube mute controls are available when the player is ready.'); return }
-    const muted = !youtubeRef.current.isMuted()
-    void playbackController.command('toggleMute')
-    setYoutubeState((previous) => ({ ...previous, muted }))
+    if (currentTrack?.provider !== 'youtube') { void playbackController.command('toggleMute'); return }
+    const player = roomSession ? roomYoutubeRef.current : standaloneYoutubeRef.current
+    if (!player?.canControl?.()) { notify('YouTube mute controls are available when the player is ready.'); return }
+    const muted = !player.isMuted()
+    if (roomSession) muted ? player.mute() : player.unMute()
+    else void playbackController.command('toggleMute')
+    const setState = roomSession ? setRoomYoutubeState : setStandaloneYoutubeState
+    setState((previous) => ({ ...previous, muted }))
   }
   const seekBy = (deltaSeconds) => {
-    const state = currentTrack.provider === 'youtube' ? youtubeState : audio.state
+    const state = currentTrack?.provider === 'youtube' ? youtubeState : audio.state
     if (!Number.isFinite(state.duration) || state.duration <= 0) { notify('Seeking is unavailable until this player reports a duration.'); return }
     handlePlayerSeek(Math.max(0, Math.min(state.duration, state.currentTime + deltaSeconds)))
   }
@@ -296,45 +438,56 @@ function App() {
     setNowPlayingOpen(true)
   }
   const closeNowPlaying = () => {
-    if (currentTrack.provider === 'youtube' && youtubeRef.current?.canControl?.()) {
-      const currentTime = youtubeRef.current.getCurrentTime()
-      youtubeRef.current.pause()
-      setYoutubeState((previous) => ({ ...previous, status: 'paused', currentTime }))
-    }
-    setYoutubeAutoplayRequested(false)
     setNowPlayingOpen(false)
     setShortcutsOpen(false)
   }
-  const handleYoutubeState = useCallback((state) => {
-    setYoutubeState((previous) => ({ ...previous, ...state }))
-    playbackController.reportProviderState('youtube', state.trackId ?? currentTrack.id, {
+  const handleStandaloneYoutubeState = useCallback((state) => {
+    if (state.trackId && state.trackId !== standaloneTrack?.id) return
+    setStandaloneYoutubeState((previous) => ({ ...previous, ...state }))
+    playbackController.reportProviderState('youtube', state.trackId ?? standaloneTrack?.id, {
       ...state,
       volume: Number.isFinite(state.volume) ? state.volume / 100 : undefined,
     })
     if (state.status === 'ready') setYoutubeAutoplayRequested(false)
-    if (state.userInitiated && roomSession && Number.isFinite(state.currentTime)) {
+  }, [standaloneTrack?.id, playbackController])
+  const handleRoomYoutubeState = useCallback((state, sourceSession) => {
+    if (!isCurrentRoomSession(roomSessionRef.current, sourceSession)
+      || roomPlaybackRef.current?.currentTrackId !== state.trackId) return
+    setRoomYoutubeState((previous) => ({ ...previous, ...state }))
+    if (state.userInitiated && Number.isFinite(state.currentTime)) {
       const socket = roomSocketRef.current
       if (!socket?.connected) { notify('Reconnect to the room before sharing this playback change.'); return }
-      socket?.emit('playback:update', { isPlaying: state.status === 'playing', positionMs: Math.round(state.currentTime * 1000) }, (result) => {
-        if (!result?.ok) notify(result?.error || 'The room playback command could not be applied.')
+      const playback = roomPlaybackRef.current
+      if (!playback?.currentTrackId || !playback.playbackToken) return
+      socket.emit('playback:update', {
+        isPlaying: state.status === 'playing',
+        positionMs: Math.round(state.currentTime * 1000),
+        expectedTrackId: playback.currentTrackId,
+        expectedPlaybackToken: playback.playbackToken,
+      }, (result) => {
+        if (!isCurrentRoomSession(roomSessionRef.current, sourceSession)) return
+        if (!result?.ok) {
+          const authoritative = roomPlaybackRef.current
+          if (authoritative) roomYoutubeRef.current?.applyRoomCommand?.(authoritative)
+          notify(result?.error || 'The room playback command could not be applied.')
+        }
       })
     }
-  }, [currentTrack.id, playbackController, roomSession])
-  const handleYoutubeEnded = useCallback(() => {
-    if (roomSession) {
-      const playback = roomPlaybackRef.current
-      if (playback?.currentTrackId && playback.playbackToken) roomSocketRef.current?.emit('playback:next', { expectedTrackId: playback.currentTrackId, expectedPlaybackToken: playback.playbackToken })
-    } else {
-      const index = tracks.findIndex((track) => track.id === currentTrack.id)
-      const action = getTrackEndAction(repeatModeRef.current, index, tracks.length)
-      if (action.type === 'replay') {
-        youtubeRef.current?.seek(0)
-        youtubeRef.current?.play()
-      } else if (action.type === 'select') {
-        void playbackController.loadTrack(tracks[action.index], { autoplay: true, openPlayer: false })
-      }
+  }, [])
+  const handleStandaloneYoutubeEnded = useCallback(() => {
+    const action = getTrackEndAction(repeatModeRef.current, 0, standaloneTrack ? 1 : 0)
+    if (action.type === 'replay') {
+      standaloneYoutubeRef.current?.seek(0)
+      standaloneYoutubeRef.current?.play()
     }
-  }, [currentTrack.id, playbackController, roomSession])
+  }, [standaloneTrack?.id, playbackController])
+  const handleRoomYoutubeEnded = useCallback((trackId, sourceSession) => {
+    if (!isCurrentRoomSession(roomSessionRef.current, sourceSession)) return
+    const playback = roomPlaybackRef.current
+    if (playback?.currentTrackId === trackId && playback.playbackToken) {
+      roomSocketRef.current?.emit('playback:next', { expectedTrackId: trackId, expectedPlaybackToken: playback.playbackToken })
+    }
+  }, [])
   const addYouTubeToRoom = (track) => {
     pendingRoomTrackRef.current = track
     setRoomDialogMode('join')
@@ -345,6 +498,10 @@ function App() {
     else notify('Browser storage is unavailable. Enable it before using YouTube search.')
   }
   const navigate = (page, tab) => {
+    if (page === 'Profile' && account.status !== 'authenticated') {
+      setActiveNav('Log in')
+      return
+    }
     setActiveNav(page)
     if (tab) setLibraryTab(tab)
   }
@@ -378,55 +535,79 @@ function App() {
 
   const openRoomDialog = (mode) => setRoomDialogMode(mode)
   const enterRoom = (session) => {
-    suspendedRoomVideoRef.current = null
-    audio.pause()
-    if (youtubeRef.current?.canControl?.()) {
-      const currentTime = youtubeRef.current.getCurrentTime()
-      youtubeRef.current.pause()
-      setYoutubeState((previous) => ({ ...previous, status: 'paused', currentTime }))
+    setRoomInviteCode('')
+    const audioElement = audio.audioRef.current
+    let position = standaloneTrack?.provider === 'youtube'
+      ? standaloneYoutubeRef.current?.getCurrentTime?.() ?? standaloneYoutubeState.currentTime
+      : audioElement?.currentTime ?? audio.state.currentTime
+    let isPlaying = standaloneTrack?.provider === 'youtube'
+      ? standaloneYoutubeRef.current?.getIsPlaying?.() ?? standaloneYoutubeState.status === 'playing'
+      : Boolean(audioElement && !audioElement.paused)
+    if (standaloneTrack?.provider === 'youtube') {
+      const suspended = standaloneYoutubeRef.current?.suspend?.()
+      if (suspended) {
+        position = suspended.currentTime
+        isPlaying = suspended.isPlaying
+        setStandaloneYoutubeState((previous) => ({ ...previous, ...suspended, status: 'paused' }))
+      } else {
+        standaloneYoutubeRef.current?.pause?.()
+      }
     }
+    standaloneSnapshotRef.current = createPlaybackSnapshot(standaloneTrack, { position, isPlaying })
+    audio.pause()
     setNowPlayingOpen(false)
     setShortcutsOpen(false)
     setYoutubeAutoplayRequested(false)
+    roomSessionRef.current = session
+    roomPlaybackRef.current = null
     setRoomPlayback(null)
     setRoomQueue([])
+    setRoomYoutubeState({ status: 'idle', currentTime: 0, duration: 0, volume: 72, muted: false, error: '' })
     setRoomSession(session)
     setRoomDialogMode(null)
   }
   const leaveRoomView = () => {
-    if (currentTrack.provider === 'youtube' && youtubeRef.current?.canControl?.()) {
-      const currentTime = youtubeRef.current.getCurrentTime()
-      youtubeRef.current.pause()
-      setYoutubeState((previous) => ({ ...previous, status: 'paused', currentTime }))
-    }
+    const snapshot = standaloneSnapshotRef.current
+    roomSessionRef.current = null
+    if (currentTrack?.provider === 'youtube') roomYoutubeRef.current?.suspend?.()
+    else audio.pause()
+    roomSocketRef.current?.disconnect()
+    roomSocketRef.current = null
+    roomPlaybackRef.current = null
     setRoomPlayback(null)
     setRoomQueue([])
-    suspendedRoomVideoRef.current = null
     setRoomSession(null)
     setActiveNav('Home')
+    if (snapshot) {
+      if (snapshot.track.provider === 'youtube') {
+        setStandaloneYoutubeState((previous) => ({ ...previous, status: snapshot.isPlaying ? 'loading' : 'paused', currentTime: snapshot.position, error: '' }))
+        standaloneYoutubeRef.current?.restorePlayback?.(snapshot)
+      } else {
+        audio.restorePlayback(snapshot)
+      }
+    }
+    standaloneSnapshotRef.current = null
     notify('You left the listening room.')
   }
 
-  return <div className={roomSession ? 'room-app-shell' : 'app-shell'}>
+  return <div className={roomSession ? 'room-app-shell' : account.status === 'authenticated' ? 'app-shell' : 'auth-shell'}>
     <audio ref={audio.audioRef} className="audio-engine-element" preload="metadata" aria-hidden="true" />
-    {roomSession ? <ListeningRoomPage session={roomSession} query={query} onQueryChange={setQuery} onLeave={leaveRoomView} onPlaybackState={onRoomPlaybackState} onQueueState={setRoomQueue} onSocketReady={onRoomSocketReady} onPlaybackCommand={handleRoomPlaybackCommand} onTrackChange={changeTrack} onToggleRepeat={cycleRepeat} repeatMode={activeRepeatMode} volumeLevel={currentVolume} muted={currentMuted} onVolumeChange={changeVolume} onToggleMute={toggleMute} onSuspendYoutube={suspendRoomYoutube} onResumeYoutube={resumeRoomYoutube} youtubeState={youtubeState} playerState={playbackState} onRegisterDismissible={registerDismissible} youtubePlayer={<YoutubeEmbed ref={youtubeRef} track={currentTrack} sharedPlayback={roomPlayback} resumeAtSeconds={suspendedRoomVideoRef.current?.trackId === currentTrack.id && suspendedRoomVideoRef.current.updatedAt === roomPlayback?.updatedAt ? suspendedRoomVideoRef.current.currentTime : undefined} resumePlaying={suspendedRoomVideoRef.current?.trackId === currentTrack.id && suspendedRoomVideoRef.current.updatedAt === roomPlayback?.updatedAt ? suspendedRoomVideoRef.current.isPlaying : undefined} onState={handleYoutubeState} onEnded={handleYoutubeEnded} placement="room"/>}/> : <>
-    <Sidebar active={activeNav} onNavigate={navigate} onCreatePlaylist={() => notify('Playlist creation will be available when Jammy can save library data.')}/>
+    {roomSession ? <ListeningRoomPage session={roomSession} query={query} onQueryChange={setQuery} onLeave={leaveRoomView} onPlaybackState={onRoomPlaybackState} onQueueState={onRoomQueueState} onSocketReady={onRoomSocketReady} onPlaybackCommand={handleRoomPlaybackCommand} onTrackChange={changeTrack} onToggleRepeat={cycleRepeat} repeatMode={activeRepeatMode} volumeLevel={currentVolume} muted={currentMuted} onVolumeChange={changeVolume} onToggleMute={toggleMute} youtubeState={roomYoutubeState} playerState={audio.state} onRegisterDismissible={registerDismissible} youtubePlayer={<YoutubeEmbed ref={roomYoutubeRef} track={currentTrack} sharedPlayback={roomPlayback} onState={(state) => handleRoomYoutubeState(state, roomSession)} onEnded={() => currentTrack && handleRoomYoutubeEnded(currentTrack.id, roomSession)} placement="room"/>}/> : account.status !== 'authenticated' ? account.status === 'loading' ? <main className="auth-loading" aria-live="polite" aria-busy="true"><span className="brand"><span className="brand-mark">j</span><span>jammy<span className="brand-period">.</span></span></span><span className="auth-loading-mark" aria-hidden="true"/><span>Restoring your session…</span></main> : <AuthPage onAuthenticated={handleAuthenticated} sessionError={account.status === 'error' ? account.error : ''} onRetrySession={restoreAccountSession}/> : <>
+    <Sidebar active={activeNav} account={account} onNavigate={navigate} onCreatePlaylist={() => notify('Playlist creation will be available when Jammy can save library data.')}/>
     <main className="main-content">
-      <header className="topbar"><div className="history-controls"><button className="round-button" aria-label="Go back" onClick={() => notify('You’re at the start')}><span>‹</span></button><button className="round-button" aria-label="Go forward"><span>›</span></button></div><label className="search-box"><Icon name="search" size={18}/><input ref={searchInputRef} value={query} onFocus={() => navigate('Search')} onChange={(e) => { setQuery(e.target.value); navigate('Search') }} placeholder="What do you want to hear?" aria-label="Search music"/><kbd>Ctrl K</kbd></label><button className="upgrade-button" onClick={() => notify('Jammy is in preview')}>Explore Jammy <Icon name="arrow" size={14}/></button><button className="top-avatar" aria-label="Your profile">J</button></header>
+      <header className="topbar"><div className="history-controls"><button className="round-button" aria-label="Go back" onClick={() => notify('You’re at the start')}><span>‹</span></button><button className="round-button" aria-label="Go forward"><span>›</span></button></div><SearchBox inputRef={searchInputRef} query={query} onQueryChange={setQuery} onNavigate={navigate} recentSearches={recentSearches} onRememberSearch={rememberSearch} onRemoveSearch={forgetSearch}/><button className="upgrade-button" onClick={() => notify('Jammy is in preview')}>Explore Jammy <Icon name="arrow" size={14}/></button><button className="top-avatar" aria-label={account.status === 'authenticated' ? `Profile for ${account.user.username}` : 'Log in'} onClick={() => navigate(account.status === 'authenticated' ? 'Profile' : 'Log in')}>{account.status === 'authenticated' ? account.user.username.slice(0, 1).toUpperCase() : 'J'}</button></header>
       {activeNav === 'Home' ? <>
-      <section className="welcome-row"><div><p className="eyebrow">TUESDAY, OCTOBER 27</p><h1>Good evening, Jordan<span>.</span></h1><p className="welcome-subtitle">A little music goes a long way. Find your next favorite.</p></div><div className="welcome-actions"><button className="outline-action" onClick={() => openRoomDialog('join')}><Icon name="users" size={17}/> Join a room</button><button className="primary-action" onClick={() => openRoomDialog('create')}><Icon name="plus" size={18}/> Create a room</button></div></section>
-      <section className="hero-card"><div className="hero-copy"><div className="hero-kicker"><span className="hero-spark">✳</span> YOUR SPACE, YOUR SOUND</div><h2>Music hits<br/>different <em>together.</em></h2><p>Set up a listening room, invite your people, and let the good songs find you.</p><button className="hero-button" onClick={() => openRoomDialog('create')}>Start a listening room <Icon name="arrow" size={16}/></button><div className="hero-foot"><span className="mini-avatars"><i>M</i><i>L</i><i>N</i><i>+</i></span><span>Good music is better shared</span></div></div><div className="hero-visual"><div className="hero-sun"/><div className="hero-ring ring-one"/><div className="hero-ring ring-two"/><div className="hero-record"><div className="record-label"><span>side A</span><b>JAM<br/>SESSIONS</b><small>001 · 33⅓ RPM</small></div></div><div className="hero-note note-top">♫</div><div className="hero-note note-bottom">♪</div><div className="hero-caption"><i/> NOW PLAYING <b>GOOD THINGS TAKE TIME</b></div></div></section>
-      <section className="section-block quick-section"><div className="section-heading"><div><p className="eyebrow">PICK UP WHERE YOU LEFT OFF</p><h2>Recently played</h2></div><button className="text-link" onClick={() => navigate('Your library')}>See all <Icon name="arrow" size={14}/></button></div><div className="track-list"><div className="track-header"><span>#</span><span>TITLE</span><span>ALBUM</span><span><Icon name="queue" size={14}/></span></div>{tracks.slice(0, 4).map((track, index) => <TrackCard key={track.title} track={track} index={index} active={currentTrack.title === track.title} onPlay={playTrack}/>)}</div></section>
-      <section className="section-block mixes-section"><div className="section-heading"><div><p className="eyebrow">MADE FOR YOUR MOOD</p><h2>Find your frequency</h2></div><button className="text-link" onClick={() => navigate('Your library')}>All mixes <Icon name="arrow" size={14}/></button></div><div className="mix-grid">{mixes.map((mix) => <MixCard key={mix.title} mix={mix} onPlay={() => notify('This sample mix has no playable audio yet.')}/>)}</div></section>
-      <section className="social-section"><div className="social-copy"><div className="social-icon"><Icon name="users" size={19}/></div><div><p className="eyebrow">GOOD TASTE TRAVELS</p><h2>Your friends have the aux.</h2><p>See what your people are into, then join the session.</p></div></div><div className="social-friends">{friends.map((friend) => <div className="social-friend" key={friend.name}><span className={`avatar ${friend.color}`}>{friend.initials}<i/></span><span><b>{friend.name}</b><small><i className="tiny-eq">♫</i> {friend.track}</small></span><button className="listen-button" onClick={() => notify(`Room invites are coming soon`)}>Listen in <Icon name="arrow" size={13}/></button></div>)}</div><button className="social-footer" onClick={() => notify('Friend activity is getting warmed up')}>See everyone’s activity <Icon name="arrow" size={14}/></button></section>
+      <section className="welcome-row"><div><h1>Welcome, {account.user.username}<span>.</span></h1><p className="welcome-subtitle">Your Jammy listening, ready when you are.</p></div><div className="welcome-actions"><button className="outline-action" onClick={() => openRoomDialog('join')}><Icon name="users" size={17}/> Join a room</button><button className="primary-action" onClick={() => openRoomDialog('create')}><Icon name="plus" size={18}/> Create a room</button></div></section>
+      <section className="hero-card"><div className="hero-copy"><div className="hero-kicker"><span className="hero-spark">✳</span> YOUR SPACE, YOUR SOUND</div><h2>Music hits<br/>different <em>together.</em></h2><p>Set up a listening room, invite your people, and let the good songs find you.</p><button className="hero-button" onClick={() => openRoomDialog('create')}>Start a listening room <Icon name="arrow" size={16}/></button><div className="hero-foot"><span>Shared playback, your people</span></div></div><div className="hero-visual"><div className="hero-sun"/><div className="hero-ring ring-one"/><div className="hero-ring ring-two"/><div className="hero-record"><div className="record-label"><span>side A</span><b>JAM<br/>SESSIONS</b><small>001 · 33⅓ RPM</small></div></div><div className="hero-note note-top">♫</div><div className="hero-note note-bottom">♪</div></div></section>
+      <HomeMusicPanel onPlayTrack={playTrack}/>
       <footer className="page-footer"><span>Made for the moments between songs.</span><span>JAMMY <i>●</i> 2026</span></footer>
-      </> : activeNav === 'Search' ? <SearchPage query={query} currentTrack={currentTrack} onPlayTrack={playTrack} onNotice={notify} onAddToRoom={addYouTubeToRoom} youtubeConsent={youtubeConsent} onAcceptYouTube={acceptYouTube}/> : <LibraryPage activeTab={libraryTab} onTabChange={setLibraryTab} currentTrack={currentTrack} onPlayTrack={playTrack} onNotice={notify}/>}
+      </> : activeNav === 'Search' ? <SearchPage query={query} currentTrack={currentTrack} onPlayTrack={playTrack} onNotice={notify} onAddToRoom={addYouTubeToRoom} youtubeConsent={youtubeConsent} onAcceptYouTube={acceptYouTube} onSearchStarted={rememberSearch}/> : activeNav === 'Profile' ? <ProfilePage account={account} onLogout={handleLogout} onRetry={restoreAccountSession} logoutBusy={accountBusy}/> : <LibraryPage activeTab={libraryTab} onTabChange={setLibraryTab} currentTrack={currentTrack} onPlayTrack={playTrack} onNotice={notify}/>}
     </main>
-    {roomDialogMode && <RoomDialog key={roomDialogMode} initialMode={roomDialogMode} onClose={() => { setRoomDialogMode(null); pendingRoomTrackRef.current = null }} onRoomReady={enterRoom} onRegisterDismissible={registerDismissible}/>}
+    {roomDialogMode && <RoomDialog key={roomDialogMode} initialMode={roomDialogMode} initialCode={roomInviteCode} onClose={() => { setRoomDialogMode(null); pendingRoomTrackRef.current = null }} onRoomReady={enterRoom} onRegisterDismissible={registerDismissible}/>}
     {toast && <div className="toast" role="status">{toast}</div>}
     </>}
-    {!roomSession && <MusicPlayer track={currentTrack} repeatMode={activeRepeatMode} onToggleRepeat={cycleRepeat} onOpenNowPlaying={openNowPlaying} volumeLevel={currentVolume} muted={currentMuted} onTrackChange={changeTrack} onCreateRoom={() => openRoomDialog('create')} audioState={playbackState} onTogglePlay={handlePlayerToggle} onSeek={handlePlayerSeek} onVolumeChange={changeVolume} onToggleMute={toggleMute} youtubeState={playbackState}/>}
-    {nowPlayingOpen && !roomSession && <NowPlayingOverlay track={currentTrack} playerState={playbackState} repeatMode={activeRepeatMode} onTogglePlay={handlePlayerToggle} onSeek={handlePlayerSeek} onToggleRepeat={cycleRepeat} volume={currentVolume} muted={currentMuted} onVolumeChange={changeVolume} onToggleMute={toggleMute} roomActive={false} roomQueue={roomQueue} onSelectQueueItem={selectRoomQueueItem} onSelectTrack={(trackOrDirection) => typeof trackOrDirection === 'number' ? changeTrack(trackOrDirection) : playTrack(trackOrDirection)} activeTab={expandedTab} onTabChange={setExpandedTab} onClose={closeNowPlaying} shortcutsOpen={shortcutsOpen} onToggleShortcuts={() => setShortcutsOpen((value) => !value)} youtubePlayer={currentTrack.provider === 'youtube' ? <div className="expanded-youtube-slot"><YoutubeEmbed ref={youtubeRef} track={currentTrack} onState={handleYoutubeState} onEnded={handleYoutubeEnded} startAtSeconds={youtubeState.currentTime} autoplayOnReady={youtubeAutoplayRequested} placement="inline"/></div> : null}/>}
+    {!roomSession && account.status === 'authenticated' && currentTrack && <MusicPlayer track={currentTrack} repeatMode={activeRepeatMode} onToggleRepeat={cycleRepeat} onOpenNowPlaying={openNowPlaying} volumeLevel={currentVolume} muted={currentMuted} onTrackChange={changeTrack} onCreateRoom={() => openRoomDialog('create')} audioState={playbackState} onTogglePlay={handlePlayerToggle} onSeek={handlePlayerSeek} onVolumeChange={changeVolume} onToggleMute={toggleMute} youtubeState={standaloneYoutubeState}/>}
+    {account.status === 'authenticated' && <NowPlayingOverlay isOpen={nowPlayingOpen && !roomSession} track={standaloneTrack} playerState={playbackState} repeatMode={repeatMode} onTogglePlay={handlePlayerToggle} onSeek={handlePlayerSeek} onToggleRepeat={cycleRepeat} volume={standaloneTrack?.provider === 'youtube' ? (standaloneYoutubeState.volume ?? 72) / 100 : playbackState.volume} muted={standaloneTrack?.provider === 'youtube' ? Boolean(standaloneYoutubeState.muted) : playbackState.muted} onVolumeChange={changeVolume} onToggleMute={toggleMute} roomActive={false} roomQueue={roomQueue} onSelectQueueItem={selectRoomQueueItem} onSelectTrack={(trackOrDirection) => typeof trackOrDirection === 'number' ? changeTrack(trackOrDirection) : playTrack(trackOrDirection)} activeTab={expandedTab} onTabChange={setExpandedTab} onClose={closeNowPlaying} shortcutsOpen={shortcutsOpen} onToggleShortcuts={() => setShortcutsOpen((value) => !value)} youtubePlayer={standaloneTrack?.provider === 'youtube' ? <div className="expanded-youtube-slot"><YoutubeEmbed ref={standaloneYoutubeRef} track={standaloneTrack} onState={handleStandaloneYoutubeState} onEnded={handleStandaloneYoutubeEnded} startAtSeconds={standaloneYoutubeState.currentTime} autoplayOnReady={youtubeAutoplayRequested} placement="inline"/></div> : null}/>}
   </div>
 }
 

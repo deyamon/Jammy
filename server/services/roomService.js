@@ -44,6 +44,15 @@ function roomSnapshot(room, members) {
   }
 }
 
+// Promote the earliest-joined online member; fall back to the earliest-joined member if all are offline.
+// Member ID breaks equal join-time ties so memory and PostgreSQL choose the same host.
+export function selectNextHost(members) {
+  return [...members]
+    .sort((left, right) => Number(right.online) - Number(left.online)
+      || Date.parse(left.joinedAt) - Date.parse(right.joinedAt)
+      || left.id.localeCompare(right.id))[0] ?? null
+}
+
 class MemoryRoomRepository {
   constructor() {
     this.rooms = new Map()
@@ -65,7 +74,11 @@ class MemoryRoomRepository {
     const room = this.rooms.get(code)
     if (!room) throw new RoomError(404, 'We couldn’t find a room with that code.', 'ROOM_NOT_FOUND')
     if (room.members.length >= room.maxMembers) throw new RoomError(409, 'This room is full.', 'ROOM_FULL')
-    const member = { id: memberId, displayName, role: 'member', joinedAt: new Date().toISOString(), online: false, tokenHash }
+    if (!room.members.some((member) => member.role === 'owner')) {
+      const nextHost = selectNextHost(room.members)
+      if (nextHost) nextHost.role = 'owner'
+    }
+    const member = { id: memberId, displayName, role: room.members.length === 0 ? 'owner' : 'member', joinedAt: new Date().toISOString(), online: false, tokenHash }
     room.members.push(member)
     return roomSnapshot(room, room.members)
   }
@@ -89,13 +102,19 @@ class MemoryRoomRepository {
     return roomSnapshot(room, room.members)
   }
 
-  async leaveRoom(code, memberId) {
+  async leaveRoom(code, memberId, { ifOffline = false } = {}) {
     const room = this.rooms.get(code)
     if (!room) return null
+    const departing = room.members.find((member) => member.id === memberId)
+    if (!departing || (ifOffline && departing.online)) return roomSnapshot(room, room.members)
     room.members = room.members.filter((member) => member.id !== memberId)
     if (room.members.length === 0) {
       this.rooms.delete(code)
       return null
+    }
+    if (departing.role === 'owner') {
+      const nextHost = selectNextHost(room.members)
+      if (nextHost) nextHost.role = 'owner'
     }
     return roomSnapshot(room, room.members)
   }
@@ -145,7 +164,17 @@ class PostgresRoomRepository {
       if (!room) throw new RoomError(404, 'We couldn’t find a room with that code.', 'ROOM_NOT_FOUND')
       const countResult = await client.query('SELECT count(*)::int AS count FROM room_members WHERE room_id = $1', [room.id])
       if (countResult.rows[0].count >= room.capacity) throw new RoomError(409, 'This room is full.', 'ROOM_FULL')
-      const role = countResult.rows[0].count === 0 ? 'owner' : 'member'
+      let role = countResult.rows[0].count === 0 ? 'owner' : 'member'
+      if (role !== 'owner') {
+        const ownerResult = await client.query('SELECT id FROM room_members WHERE room_id = $1 AND role = \'owner\' LIMIT 1', [room.id])
+        if (!ownerResult.rows[0]) {
+          const memberResult = await client.query('SELECT id, joined_at, online FROM room_members WHERE room_id = $1', [room.id])
+          const nextHost = selectNextHost(memberResult.rows.map((member) => ({ id: member.id, joinedAt: member.joined_at.toISOString(), online: member.online })))
+          if (nextHost) {
+            await client.query("UPDATE room_members SET role = 'owner' WHERE room_id = $1 AND id = $2", [room.id, nextHost.id])
+          }
+        }
+      }
       await client.query(
         `INSERT INTO room_members (id, room_id, display_name, role, member_token_hash)
          VALUES ($1, $2, $3, $4, $5)`,
@@ -195,14 +224,24 @@ class PostgresRoomRepository {
   }
 
   async setOnline(code, memberId, online) {
-    await this.pool.query(
-      `UPDATE room_members m SET online = $3 FROM rooms r
-       WHERE r.id = m.room_id AND r.code = $1 AND m.id = $2`, [code, memberId, online],
-    )
-    return this.getRoom(code)
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      const roomResult = await client.query('SELECT id FROM rooms WHERE code = $1 FOR UPDATE', [code])
+      const roomId = roomResult.rows[0]?.id
+      if (!roomId) { await client.query('COMMIT'); return null }
+      const memberResult = await client.query(
+        'UPDATE room_members SET online = $3 WHERE room_id = $1 AND id = $2 RETURNING id', [roomId, memberId, online],
+      )
+      await client.query('COMMIT')
+      return memberResult.rowCount ? this.getRoom(code) : null
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally { client.release() }
   }
 
-  async leaveRoom(code, memberId) {
+  async leaveRoom(code, memberId, { ifOffline = false } = {}) {
     const client = await this.pool.connect()
     try {
       await client.query('BEGIN')
@@ -212,12 +251,23 @@ class PostgresRoomRepository {
         await client.query('COMMIT')
         return null
       }
+      const memberResult = await client.query('SELECT id, role, online FROM room_members WHERE room_id = $1 AND id = $2 FOR UPDATE', [room.id, memberId])
+      const departing = memberResult.rows[0]
+      if (!departing || (ifOffline && departing.online)) {
+        await client.query('COMMIT')
+        return this.getRoom(code)
+      }
       await client.query('DELETE FROM room_members WHERE room_id = $1 AND id = $2', [room.id, memberId])
       const countResult = await client.query('SELECT count(*)::int AS count FROM room_members WHERE room_id = $1', [room.id])
       if (countResult.rows[0].count === 0) {
         await client.query('DELETE FROM rooms WHERE id = $1', [room.id])
         await client.query('COMMIT')
         return null
+      }
+      if (departing.role === 'owner') {
+        const remainingResult = await client.query('SELECT id, joined_at, online FROM room_members WHERE room_id = $1', [room.id])
+        const nextHost = selectNextHost(remainingResult.rows.map((member) => ({ id: member.id, joinedAt: member.joined_at.toISOString(), online: member.online })))
+        if (nextHost) await client.query("UPDATE room_members SET role = 'owner' WHERE room_id = $1 AND id = $2", [room.id, nextHost.id])
       }
       await client.query('COMMIT')
       return this.getRoom(code)
@@ -258,7 +308,7 @@ export class RoomService {
     if (!member || !tokenMatches(member.tokenHash, memberToken)) {
       throw new RoomError(401, 'Your room session is no longer valid. Join the room again.', 'ROOM_SESSION_INVALID')
     }
-    return { code, memberId, memberToken, displayName: member.displayName }
+    return { code, memberId, memberToken, displayName: member.displayName, role: member.role }
   }
 
   async getRoom(identity) {
@@ -274,5 +324,9 @@ export class RoomService {
   async leaveRoom(identity) {
     await this.authenticate(identity)
     return this.repository.leaveRoom(identity.code, identity.memberId)
+  }
+
+  async leaveRoomIfOffline(identity) {
+    return this.repository.leaveRoom(identity.code, identity.memberId, { ifOffline: true })
   }
 }

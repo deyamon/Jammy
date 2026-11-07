@@ -4,11 +4,11 @@ import { createRoom, joinRoom } from '../services/roomApi.js'
 
 const NAME_KEY = 'jammy-guest-name'
 
-export default function RoomDialog({ initialMode = 'create', onClose, onRoomReady, onRegisterDismissible }) {
+export default function RoomDialog({ initialMode = 'create', initialCode = '', onClose, onRoomReady, onRegisterDismissible }) {
   const [mode, setMode] = useState(initialMode)
   const [displayName, setDisplayName] = useState(() => window.localStorage.getItem(NAME_KEY) || '')
   const [roomName, setRoomName] = useState('Jammy listening room')
-  const [roomCode, setRoomCode] = useState('')
+  const [roomCode, setRoomCode] = useState(() => String(initialCode).replace(/[^a-z0-9]/gi, '').slice(0, 6).toUpperCase())
   const [maxMembers, setMaxMembers] = useState('8')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)

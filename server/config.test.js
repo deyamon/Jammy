@@ -16,7 +16,9 @@ test('loads project-root .env regardless of the current working directory', asyn
   try {
     await mkdir(serverDirectory, { recursive: true })
     await mkdir(otherWorkingDirectory)
-    await writeFile(join(projectRoot, '.env'), 'YOUTUBE_API_KEY=fake-test-key\n')
+    const testDatabaseUrl = 'postgresql://test-user:test-password@localhost:5432/jammy_test?sslmode=require'
+    await writeFile(join(projectRoot, '.env'), `YOUTUBE_API_KEY=fake-test-key\nDATABASE_URL=postgresql://template:template@localhost:5432/template\n`)
+    await writeFile(join(projectRoot, '.env.local'), `DATABASE_URL=${testDatabaseUrl}\nNEON_AUTH_BASE_URL=https://auth.example.test\n`)
     await writeFile(join(serverDirectory, 'server.js'), '')
     process.chdir(otherWorkingDirectory)
 
@@ -28,6 +30,8 @@ test('loads project-root .env regardless of the current working directory', asyn
 
     assert.equal(resolvedRoot, projectRoot)
     assert.equal(isolatedEnvironment.YOUTUBE_API_KEY, 'fake-test-key')
+    assert.equal(isolatedEnvironment.DATABASE_URL, testDatabaseUrl)
+    assert.equal(isolatedEnvironment.NEON_AUTH_BASE_URL, 'https://auth.example.test')
     assert.equal(isYouTubeApiKeyConfigured(isolatedEnvironment), true)
     assert.equal(isYouTubeApiKeyConfigured({}), false)
 
