@@ -70,12 +70,12 @@ export function createAuthMiddleware({ authService, allowedOrigins }) {
 
 function writeSessionCookie(response, session, secure) {
   response.cookie(SESSION_COOKIE, session.token, {
-    httpOnly: true, sameSite: 'lax', secure, path: '/', expires: session.expiresAt,
+    httpOnly: true, sameSite: secure ? 'none' : 'lax', secure, path: '/', expires: session.expiresAt,
   })
 }
 
 function clearSessionCookie(response, secure) {
-  response.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: 'lax', secure, path: '/' })
+  response.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: secure ? 'none' : 'lax', secure, path: '/' })
 }
 
 export function createAuthRouter({ authService, allowedOrigins, secureCookies = process.env.NODE_ENV === 'production', loginRateLimiter, registrationRateLimiter } = {}) {
