@@ -17,7 +17,7 @@ export default function Sidebar({ active, account, onNavigate }) {
   return <aside className="sidebar">
     <a className="brand" href="#home" onClick={(e) => { e.preventDefault(); onNavigate('Home') }} aria-label="Jammy home"><span className="brand-mark">j</span><span>jammy<span className="brand-period">.</span></span></a>
     <nav className="main-nav" aria-label="Main navigation" data-account-count={links.length}>
-      {links.map((link) => <button key={link.label} className={`nav-link ${active === link.label ? 'active' : ''}`} onClick={() => onNavigate(link.label)}><Icon name={link.icon} size={19}/><span>{link.label}</span>{active === link.label && <i/>}</button>)}
+      {links.map((link) => <button key={link.label} className={`nav-link ${active === link.label ? 'active' : ''}`} aria-current={active === link.label ? 'page' : undefined} onClick={() => onNavigate(link.label)}><Icon name={link.icon} size={19}/><span>{link.label}</span>{active === link.label && <i/>}</button>)}
     </nav>
     <div className="sidebar-rule"/>
     <div className="library-heading"><span>YOUR COLLECTION</span></div>

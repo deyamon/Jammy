@@ -98,7 +98,8 @@ function VoiceAvatar({ participant, size = 'regular' }) {
 export default function RoomVoicePanel({
   voiceState, currentMemberId, members = [], voiceClientRef, disabled = false,
 }) {
-  const [expanded, setExpanded] = useState(true)
+  // Phones start with the compact launcher so the panel doesn't cover the room.
+  const [expanded, setExpanded] = useState(() => typeof window === 'undefined' || !window.matchMedia?.('(max-width: 650px)').matches)
   const audioContextRef = useRef(null)
   const remoteStreams = voiceState.remoteStreams ?? new Map()
   const peerStates = voiceState.peerStates ?? new Map()

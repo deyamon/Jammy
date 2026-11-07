@@ -1,0 +1,133 @@
+/*
+ * Mobile-first polish. Loaded last so it wins over the older layered rules
+ * in styles.css / responsive.css / room.css. Goals: consistent 16px gutters,
+ * 44px touch targets, no overlapping copy, and a clean bottom navigation.
+ */
+
+/* ---------- Shared button sizing (all widths) ---------- */
+.outline-action,.primary-action,.hero-button{min-height:40px;justify-content:center;white-space:nowrap}
+.outline-action:disabled,.primary-action:disabled{opacity:.6;cursor:not-allowed}
+/* Hero caption sits in the flow under the button instead of overlapping it. */
+.hero-copy{display:flex;flex-direction:column;align-items:flex-start;box-sizing:border-box;height:100%}
+.hero-foot{position:static;margin-top:auto;padding-top:14px}
+
+/* Touch devices: no sticky hover highlight after a tap. */
+@media(hover:none){
+  .nav-link:hover:not(.active){background:none}
+}
+
+/* ---------- Tablet and below ---------- */
+@media(max-width:760px){
+  /* Page gutters + top bar */
+  .main-content{padding:0 16px}
+  .topbar{height:64px;gap:10px;border-bottom:0}
+  .search-box,.search-box-wrap{height:44px}
+  .search-box input{font-size:16px} /* 16px stops iOS zooming into the field */
+  .top-avatar{width:40px;height:40px;font-size:14px;flex:none}
+
+  /* Bottom navigation: evenly spaced, clear active state */
+  .sidebar{height:calc(64px + env(safe-area-inset-bottom));padding:6px 8px max(6px,env(safe-area-inset-bottom));background:var(--surface-primary);z-index:20}
+  .main-nav,.main-nav[data-account-count="4"]{width:100%;max-width:520px;margin:0 auto;gap:4px}
+  .nav-link{height:52px;flex-direction:column;justify-content:center;gap:4px;padding:0;border-radius:12px;font-size:11px;font-weight:600;color:var(--text-secondary)}
+  .nav-link span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .nav-link svg{width:20px;height:20px}
+  .nav-link.active{background:var(--background-primary);color:var(--color-cotton)}
+  .nav-link.active i{top:3px;right:auto;left:50%;width:18px;height:3px;border-radius:3px;transform:translateX(-50%)}
+  .app-shell{padding-bottom:calc(84px + env(safe-area-inset-bottom))}
+  .app-shell:has(.music-player){padding-bottom:calc(156px + env(safe-area-inset-bottom))}
+  .music-player{bottom:calc(64px + env(safe-area-inset-bottom));z-index:19}
+  .toast{bottom:calc(150px + env(safe-area-inset-bottom));left:16px;right:16px;max-width:none;white-space:normal;text-align:center;transform:none}
+
+  /* Welcome row */
+  .welcome-row{display:flex;flex-direction:column;align-items:stretch;gap:16px;padding:20px 0 20px}
+  .welcome-row h1{font-size:28px;letter-spacing:-1px;margin:0 0 6px}
+  .welcome-subtitle{max-width:none;font-size:13px;line-height:1.5}
+  .welcome-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;width:100%;padding:0}
+  .welcome-actions>*,.welcome-actions .outline-action,.welcome-actions .primary-action{min-height:46px;padding:0 12px;font-size:13px;border-radius:10px}
+
+  /* Hero: copy on top of a faded visual, nothing overlapping */
+  .hero-card{height:auto;min-height:0;border-radius:14px}
+  .hero-copy{width:100%;padding:24px 20px;display:flex;flex-direction:column;align-items:flex-start}
+  .hero-copy h2{font-size:32px;margin:12px 0 10px}
+  .hero-copy p{max-width:62%;font-size:13px;line-height:1.55}
+  .hero-button{min-height:44px;margin-top:20px;padding:0 16px;font-size:13px;border-radius:10px}
+  .hero-foot{display:none}
+  .hero-visual{position:absolute;inset:0 0 0 auto;width:48%;opacity:.4;pointer-events:none}
+
+  /* Sections + cards */
+  .section-block{margin-top:28px}
+  .section-heading{gap:10px}
+  .section-heading h2{font-size:20px}
+  .text-link{min-height:40px;font-size:13px}
+  .empty-state{font-size:13px;line-height:1.5}
+  .personal-music-empty{gap:6px}
+  .personal-music-empty p{margin:0;font-size:13px;line-height:1.5}
+  .spotify-insights{padding:18px 16px;border-radius:14px}
+  .spotify-insights .section-heading{flex-direction:column;align-items:flex-start;gap:6px}
+  .spotify-data-label{max-width:none;text-align:left;font-size:11px}
+  .spotify-connection-copy{font-size:13px;line-height:1.55;margin:12px 0 16px}
+  .spotify-insights .primary-action,.spotify-actions .primary-action,.spotify-actions .outline-action{min-height:44px;font-size:13px;padding:0 16px;border-radius:10px}
+  .spotify-actions{display:flex;flex-wrap:wrap;gap:10px}
+  .page-footer{flex-wrap:wrap;gap:8px;font-size:11px;padding-top:28px}
+
+  /* Search / library / profile pages */
+  .page-view{padding:20px 0 24px}
+  .page-intro h1{font-size:30px}
+  .page-intro>p:last-child,.library-intro p:last-child{font-size:13px;line-height:1.5}
+  .library-tabs{gap:8px;overflow-x:auto;scrollbar-width:none}
+  .library-tabs button{min-height:40px;padding:0 14px;font-size:13px;white-space:nowrap;border-radius:10px}
+  .account-page{padding:20px 0}
+  .account-card{padding:22px 18px;border-radius:14px}
+
+  /* Dialogs */
+  .room-dialog{border-radius:16px}
+  .room-form input,.room-form select{min-height:46px;font-size:16px}
+  .room-dialog-tabs button{min-height:42px}
+
+  /* Listening room header */
+  .room-top-search{height:46px}
+  .room-top-search input{font-size:16px}
+  .room-top-search>button{min-height:36px;padding:0 12px;border-radius:8px}
+  .room-header-actions{gap:8px}
+  .room-header-actions .room-leave-top{min-height:40px;padding:0 14px}
+  .connection-pill{min-height:32px}
+  .room-code-card .copy-code{min-height:36px;padding:0 10px;font-size:11px;white-space:nowrap}
+}
+@media(max-width:650px){
+  .listening-room-page{padding-left:16px;padding-right:16px}
+  .room-heading{display:grid;grid-template-columns:1fr;gap:14px;padding:20px 0 16px}
+  .room-code-card{width:100%;max-width:none;min-width:0;margin:0;padding:12px 14px;box-sizing:border-box}
+  .room-code-card>div{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .room-code-card strong{font-size:20px;letter-spacing:2px}
+  .room-code-card .copy-code{flex:none}
+  .room-mobile-tabs button{min-height:44px;font-size:13px}
+}
+
+/* ---------- Phones ---------- */
+@media(max-width:520px){
+  .history-controls{display:none}
+  .welcome-row h1{font-size:26px}
+  .hero-copy{padding:22px 18px}
+  .hero-copy h2{font-size:30px}
+  .hero-copy p{max-width:70%}
+  .hero-visual{width:52%;opacity:.3}
+
+  /* Compact player above the bottom nav */
+  .music-player{height:68px;padding:0 10px;gap:8px}
+  .music-player .player-controls .icon-button{width:40px;height:40px}
+  .music-player .player-controls .play-button{width:42px;height:42px}
+  .now-track b{max-width:none}
+}
+
+/* Very small phones (≤360px) */
+@media(max-width:360px){
+  .main-content{padding:0 12px}
+  .top-avatar{display:grid;width:36px;height:36px}
+  .welcome-actions>*,.welcome-actions .outline-action,.welcome-actions .primary-action{padding:0 8px;font-size:12px}
+  .nav-link{font-size:10px}
+  .hero-copy p{max-width:none}
+  .hero-visual{opacity:.18}
+}
+@media(max-width:330px){
+  .welcome-actions{grid-template-columns:1fr}
+}
