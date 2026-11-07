@@ -29,6 +29,9 @@ export function initializeRoomSockets(io, roomService, queueService, reconnectGr
     if (room) io.to(code).emit('room:state', room)
     else {
       io.to(code).emit('room:closed', { code })
+      // The room is empty: free its queue, chat and voice state from memory.
+      // Accounts and listening history live in Postgres and are untouched.
+      voiceSignaling.removeRoom(code)
       await queueService.removeRoom(code)
       chatService?.removeRoom(code)
     }

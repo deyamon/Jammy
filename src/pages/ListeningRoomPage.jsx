@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { cloneElement, isValidElement, useEffect, useRef, useState } from 'react'
 import Icon from '../components/Icon.jsx'
 import { leaveRoom } from '../services/roomApi.js'
 import { connectToRoom } from '../services/roomSocket.js'
@@ -27,7 +27,7 @@ function trackArt(track, className = '') {
 export default function ListeningRoomPage({
   session, query, onQueryChange, sampleTrack, onLeave, onPlaybackState, onSocketReady,
   onPlaybackCommand, onTrackChange, onToggleRepeat, repeatMode = 'off', volumeLevel = 0.72, muted = false,
-  onVolumeChange, onToggleMute, youtubePlayer, youtubeState, playerState, onQueueState, onRegisterDismissible,
+  onVolumeChange, onToggleMute, youtubePlayer: sharedYoutubePlayer, youtubeState, playerState, onQueueState, onRegisterDismissible,
 }) {
   const [room, setRoom] = useState(session.room)
   const [queue, setQueue] = useState([])
@@ -57,6 +57,8 @@ export default function ListeningRoomPage({
   const chatEndRef = useRef(null)
   const currentTrack = playback.currentTrack ?? null
   const isHost = room.members.some((member) => member.id === session.member.id && member.role === 'owner')
+  // Only the host may seek/pause; guests get a locked player that follows the host.
+  const youtubePlayer = isValidElement(sharedYoutubePlayer) ? cloneElement(sharedYoutubePlayer, { controlsLocked: !isHost }) : sharedYoutubePlayer
   const progress = getRoomProgressState(currentTrack, { youtubeState, audioState: playerState })
   const duration = progress.duration
   const currentTime = progress.currentTime

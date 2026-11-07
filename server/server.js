@@ -15,7 +15,7 @@ import { createMusicRouter } from './routes/music.js'
 import { createSpotifyRouter } from './routes/spotify.js'
 import { AuthService } from './services/authService.js'
 import { isYouTubeApiKeyConfigured, loadProjectEnvironment } from './config.js'
-import { getVoiceIceServers } from './voiceConfig.js'
+import { createVoiceIceServerProvider } from './voiceConfig.js'
 
 loadProjectEnvironment(import.meta.url)
 
@@ -24,7 +24,7 @@ const roomStore = (process.env.ROOM_STORE ?? 'memory').toLowerCase()
 const allowedOrigins = (process.env.CLIENT_ORIGINS ?? 'http://localhost:5173,http://127.0.0.1:5173')
   .split(',').map((origin) => origin.trim()).filter(Boolean)
 const reconnectGraceMs = Math.min(Math.max(Number.parseInt(process.env.RECONNECT_GRACE_MS ?? '30000', 10), 1000), 120000)
-const voiceIceServers = getVoiceIceServers()
+const voiceIceServers = createVoiceIceServerProvider()
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be a valid TCP port.')
 if (!['memory', 'postgres'].includes(roomStore)) throw new Error('ROOM_STORE must be either memory or postgres.')

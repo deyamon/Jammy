@@ -11,6 +11,22 @@
 .hero-copy{display:flex;flex-direction:column;align-items:flex-start;box-sizing:border-box;height:100%}
 .hero-foot{position:static;margin-top:auto;padding-top:14px}
 
+/* Lyrics panel: stay inside the player card and wrap long video titles. */
+.room-media-stage,.room-view-panel{box-sizing:border-box;max-width:100%;min-width:0}
+.room-lyrics-panel{width:100%;grid-template-columns:minmax(0,1fr);gap:12px;overflow:hidden}
+.room-lyrics-heading{min-width:0;padding:0 4px}
+.room-lyrics-heading h3{white-space:normal;overflow-wrap:anywhere;line-height:1.3;font-size:16px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.room-lyrics-heading p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.room-lyrics-content{margin-top:0;min-width:0;box-sizing:border-box}
+.room-lyrics-content>b{font-size:14px}
+.room-lyrics-content>p{font-size:12px;line-height:1.6}
+
+/* Non-host guests watch the host's YouTube player; the overlay blocks local seeking. */
+.youtube-player-viewport-wrap{position:relative}
+.youtube-control-lock{position:absolute;inset:0;z-index:2;display:grid;place-items:end center;padding:12px;background:transparent;cursor:not-allowed}
+.youtube-control-lock>span{padding:6px 10px;border-radius:999px;background:rgba(16,14,14,.78);color:var(--color-cotton);font-size:11px;font-weight:600;pointer-events:none}
+.youtube-control-lock>button{min-height:44px;padding:0 18px;border:0;border-radius:10px;background:var(--accent-primary);color:var(--color-cotton);font-size:13px;font-weight:700;cursor:pointer;align-self:center}
+
 /* Touch devices: no sticky hover highlight after a tap. */
 @media(hover:none){
   .nav-link:hover:not(.active){background:none}

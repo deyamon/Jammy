@@ -124,7 +124,7 @@ export class VoiceSignaling {
         ok: true,
         memberId: identity.memberId,
         participants: this.participants(identity.code),
-        iceServers: this.iceServers,
+        iceServers: typeof this.iceServers === 'function' ? await this.iceServers() : this.iceServers,
       })
       this.publish(identity.code)
     } catch (error) {
@@ -207,6 +207,14 @@ export class VoiceSignaling {
       this.remove(identity.code, identity.memberId)
     }, this.reconnectGraceMs)
     participant.reconnectTimer.unref?.()
+  }
+
+  // Drop every in-memory voice participant for a room that has closed.
+  removeRoom(code) {
+    const participants = this.rooms.get(code)
+    if (!participants) return
+    for (const participant of participants.values()) if (participant.reconnectTimer) clearTimeout(participant.reconnectTimer)
+    this.rooms.delete(code)
   }
 
   removeMember(memberId) {

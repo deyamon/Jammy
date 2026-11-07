@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { isRoomCommandEcho } from './roomCommandGuard.js'
 import { applyRoomPlaybackCommand, playYouTubeFromUserGesture, restoreYouTubePlayback } from './youtubeCommands.js'
 import { isValidYouTubeVideoId } from './soloYouTubePlayback.js'
@@ -34,8 +34,17 @@ const unavailable = {
   150: 'The owner does not allow this video to play in Jammy.',
 }
 
-const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, onState, onEnded, autoplayOnReady = false, startAtSeconds = 0, resumeAtSeconds, resumePlaying, placement = 'inline' }, ref) {
+// Seconds a guest may drift from the host before being snapped back.
+const GUEST_DRIFT_TOLERANCE_SECONDS = 2.5
+
+const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, onState, onEnded, autoplayOnReady = false, startAtSeconds = 0, resumeAtSeconds, resumePlaying, placement = 'inline', controlsLocked = false }, ref) {
   const mountRef = useRef(null)
+  const lockedRef = useRef(controlsLocked)
+  lockedRef.current = controlsLocked
+  const sharedReceivedAtRef = useRef(Date.now())
+  const wasPlayingWhenHiddenRef = useRef(false)
+  const [localPlaying, setLocalPlaying] = useState(false)
+  const [playerReady, setPlayerReady] = useState(false)
   const playerRef = useRef(null)
   const playerReadyRef = useRef(false)
   const suppressEventsRef = useRef(false)
@@ -93,6 +102,35 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
     handlersRef.current.onState?.({ status: 'paused', error: 'Scroll the official YouTube player into view to start playback.' })
     return false
   }
+
+  // Where the host's playback should be right now, measured with the local
+  // clock from when the last shared update arrived (avoids device clock skew).
+  const expectedSharedSeconds = (shared) => {
+    const base = Number.isFinite(shared?.positionMs) ? shared.positionMs / 1000 : 0
+    return shared?.isPlaying ? base + (Date.now() - sharedReceivedAtRef.current) / 1000 : base
+  }
+  // Guests follow the host: undo any local seek/pause and stay in sync.
+  const enforceSharedPlayback = (player = playerRef.current) => {
+    const shared = sharedPlaybackRef.current
+    const YT = window.YT
+    if (!lockedRef.current || !player || !playerReadyRef.current || !YT || !shared || shared.currentTrackId !== track?.id) return
+    const state = player.getPlayerState?.()
+    if (state === YT.PlayerState.BUFFERING) return
+    const expected = expectedSharedSeconds(shared)
+    const current = player.getCurrentTime?.() || 0
+    const needsSeek = Math.abs(current - expected) > GUEST_DRIFT_TOLERANCE_SECONDS
+    const needsPlay = shared.isPlaying && state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.ENDED
+    const needsPause = !shared.isPlaying && state === YT.PlayerState.PLAYING
+    if (!needsSeek && !needsPlay && !needsPause) return
+    suppressEventsRef.current = true
+    remoteCommandRef.current = { isPlaying: Boolean(shared.isPlaying), expiresAt: Date.now() + 60_000 }
+    if (needsSeek) player.seekTo(Math.max(0, expected), true)
+    if (needsPlay) player.playVideo?.()
+    if (needsPause) player.pauseVideo?.()
+    window.setTimeout(() => { suppressEventsRef.current = false }, 900)
+  }
+  const enforceRef = useRef(enforceSharedPlayback)
+  enforceRef.current = enforceSharedPlayback
 
   useImperativeHandle(ref, () => ({
     canControl: () => Boolean(playerReadyRef.current && playerRef.current),
@@ -165,11 +203,12 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
         width: 480,
         height: 270,
         videoId,
-        playerVars: { controls: 1, playsinline: 1, origin: window.location.origin },
+        playerVars: { controls: lockedRef.current ? 0 : 1, disablekb: lockedRef.current ? 1 : 0, playsinline: 1, origin: window.location.origin },
         events: {
           onReady: (event) => {
             playerRef.current = event.target
             playerReadyRef.current = true
+            setPlayerReady(true)
             lastVideoIdRef.current = videoId
             const shared = sharedPlaybackRef.current
             const pendingRestore = pendingRestoreRef.current
@@ -198,12 +237,20 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
               : event.data === states.BUFFERING ? 'loading'
                 : event.data === states.PAUSED ? 'paused'
                   : event.data === states.ENDED ? 'ended' : 'ready'
+            setLocalPlaying(event.data === states.PLAYING)
             handlersRef.current.onState?.({ status, currentTime: event.target.getCurrentTime?.() || 0, duration: event.target.getDuration?.() || 0, volume: event.target.getVolume?.() ?? 72, muted: Boolean(event.target.isMuted?.()), error: '' })
             if (event.data === states.ENDED) handlersRef.current.onEnded?.()
             const remote = remoteCommandRef.current
             const remoteMatches = isRoomCommandEcho(remote, status)
             if (remote && !remoteMatches) remoteCommandRef.current = null
-            if (!suppressEventsRef.current && !remoteMatches && (event.data === states.PLAYING || event.data === states.PAUSED)) {
+            // Guests can't change shared playback: snap back to the host instead.
+            if (lockedRef.current) {
+              if (!suppressEventsRef.current && !remoteMatches) window.setTimeout(() => enforceRef.current(event.target), 250)
+              return
+            }
+            // A browser pausing a backgrounded tab is not a host decision; don't broadcast it.
+            const pausedByBackground = event.data === states.PAUSED && document.visibilityState === 'hidden'
+            if (!suppressEventsRef.current && !remoteMatches && !pausedByBackground && (event.data === states.PLAYING || event.data === states.PAUSED)) {
               handlersRef.current.onState?.({ status, currentTime: event.target.getCurrentTime?.() || 0, duration: event.target.getDuration?.() || 0, userInitiated: true })
             }
           },
@@ -212,12 +259,15 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
         },
       })
       playerRef.current = player
+      let tick = 0
       pollId = window.setInterval(() => {
         const active = playerRef.current
         if (active?.getPlayerState?.() === YT.PlayerState.PLAYING) handlersRef.current.onState?.({
           status: 'playing', currentTime: active.getCurrentTime?.() || 0, duration: active.getDuration?.() || 0,
           volume: active.getVolume?.() ?? 72, muted: Boolean(active.isMuted?.()),
         })
+        tick += 1
+        if (tick % 3 === 0 && document.visibilityState === 'visible') enforceRef.current(active)
       }, 1000)
     }).catch((error) => handlersRef.current.onState?.({ status: 'error', error: error?.message || 'The YouTube player could not be initialized. Try selecting the video again.' }))
     return () => {
@@ -227,10 +277,50 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
       playerRef.current?.destroy?.()
       playerRef.current = null
       playerReadyRef.current = false
+      setPlayerReady(false)
+      setLocalPlaying(false)
       lastVideoIdRef.current = null
       pendingRestoreRef.current = null
     }
   }, [videoId])
+
+  // Mobile browsers pause embedded video when the app is backgrounded. When the
+  // user comes back, rejoin the host (guests) or resume what was playing (solo/host).
+  useEffect(() => {
+    const onVisibility = () => {
+      const player = playerRef.current
+      const YT = window.YT
+      if (!player || !playerReadyRef.current || !YT) return
+      if (document.visibilityState === 'hidden') {
+        wasPlayingWhenHiddenRef.current = player.getPlayerState?.() === YT.PlayerState.PLAYING
+        return
+      }
+      if (lockedRef.current) { enforceRef.current(player); return }
+      const shared = sharedPlaybackRef.current
+      const shouldPlay = shared ? Boolean(shared.isPlaying) : wasPlayingWhenHiddenRef.current
+      if (shouldPlay && player.getPlayerState?.() !== YT.PlayerState.PLAYING) {
+        suppressEventsRef.current = true
+        player.playVideo?.()
+        window.setTimeout(() => { suppressEventsRef.current = false }, 900)
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [])
+
+  // Lock screen / notification metadata where the browser supports it.
+  useEffect(() => {
+    const session = typeof navigator !== 'undefined' ? navigator.mediaSession : null
+    if (!session || !videoId || typeof window.MediaMetadata !== 'function') return
+    try {
+      session.metadata = new window.MediaMetadata({
+        title: track?.title || 'Jammy',
+        artist: track?.channelName || track?.artist || 'Jammy',
+        album: 'Jammy',
+        artwork: [{ src: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, sizes: '480x360', type: 'image/jpeg' }],
+      })
+    } catch { /* metadata is best-effort */ }
+  }, [videoId, track?.title, track?.channelName, track?.artist])
 
   useEffect(() => {
     const player = playerRef.current
@@ -247,6 +337,7 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
     const player = playerRef.current
     if (!player || !playerReadyRef.current || !sharedPlayback || sharedPlayback.currentTrackId !== track?.id || !sharedPlayback.updatedAt || sharedPlayback.updatedAt === lastRoomUpdateRef.current) return
     lastRoomUpdateRef.current = sharedPlayback.updatedAt
+    sharedReceivedAtRef.current = Date.now()
     suppressEventsRef.current = true
     remoteCommandRef.current = { isPlaying: Boolean(sharedPlayback.isPlaying), expiresAt: Date.now() + 60_000 }
     const currentTime = player.getCurrentTime?.() || 0
@@ -257,7 +348,17 @@ const YoutubeEmbed = forwardRef(function YoutubeEmbed({ track, sharedPlayback, o
   }, [sharedPlayback?.updatedAt, sharedPlayback?.isPlaying, sharedPlayback?.positionMs, sharedPlayback?.currentTrackId, track?.id])
 
   if (!videoId) return null
-  return <div className={`youtube-player-dock youtube-player-${placement}`} aria-label="YouTube video player"><div className="youtube-player-heading"><span>YouTube player</span><a href={`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`} target="_blank" rel="noreferrer">Open on YouTube ↗</a></div><div className="youtube-player-viewport" ref={mountRef}/></div>
+  const needsTapToListen = controlsLocked && playerReady && Boolean(sharedPlayback?.isPlaying) && sharedPlayback?.currentTrackId === track?.id && !localPlaying
+  const tapToListen = () => {
+    const player = playerRef.current
+    if (!player || !playerReadyRef.current) return
+    const shared = sharedPlaybackRef.current
+    suppressEventsRef.current = true
+    if (shared) player.seekTo?.(Math.max(0, expectedSharedSeconds(shared)), true)
+    playYouTubeFromUserGesture(player)
+    window.setTimeout(() => { suppressEventsRef.current = false }, 900)
+  }
+  return <div className={`youtube-player-dock youtube-player-${placement}`} aria-label="YouTube video player"><div className="youtube-player-heading"><span>YouTube player</span><a href={`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`} target="_blank" rel="noreferrer">Open on YouTube ↗</a></div><div className="youtube-player-viewport-wrap"><div className="youtube-player-viewport" ref={mountRef}/>{controlsLocked && <div className="youtube-control-lock">{needsTapToListen ? <button type="button" onClick={tapToListen}>Tap to listen with the room</button> : <span>The host controls playback</span>}</div>}</div></div>
 })
 
 export default YoutubeEmbed
