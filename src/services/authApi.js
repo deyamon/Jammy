@@ -18,6 +18,7 @@ function userPayload(user) {
       id: user.id,
       username,
       ...(typeof user.email === 'string' ? { email: user.email } : {}),
+      ...(typeof user.emailVerified === 'boolean' ? { emailVerified: user.emailVerified } : {}),
       ...(user.createdAt ? { createdAt: new Date(user.createdAt).toISOString() } : {}),
     },
   }
@@ -120,6 +121,18 @@ export function createAccountApi(authClient) {
     async logoutAccount() {
       await unwrap(async () => (await client()).signOut(), 'sign out')
     },
+    async requestPasswordReset({ email, redirectTo }) {
+      await unwrap(async () => (await client()).requestPasswordReset({ email, redirectTo }), 'password reset request')
+    },
+    async resetPassword({ token, newPassword }) {
+      await unwrap(async () => (await client()).resetPassword({ token, newPassword }), 'password reset')
+    },
+    async changePassword({ currentPassword, newPassword }) {
+      await unwrap(async () => (await client()).changePassword({ currentPassword, newPassword, revokeOtherSessions: true }), 'password change')
+    },
+    async resendVerificationEmail({ email, callbackURL }) {
+      await unwrap(async () => (await client()).sendVerificationEmail({ email, callbackURL }), 'verification email')
+    },
     async getBearerToken() {
       let neonAuth
       try { neonAuth = await authInstance() }
@@ -183,7 +196,7 @@ const loadNeonAuthClient = authUrl || authUrlError ? async () => {
 } : null
 const accountApi = createAccountApi(loadNeonAuthClient)
 
-export const { getAuthSession, loginAccount, logoutAccount, registerAccount } = accountApi
+export const { getAuthSession, loginAccount, logoutAccount, registerAccount, requestPasswordReset, resetPassword, changePassword, resendVerificationEmail } = accountApi
 
 export async function getNeonAuthBearerToken() {
   if (!loadNeonAuthClient) throw new AuthApiError('Neon Auth is not configured for this app.', { status: 503, code: 'AUTH_UNAVAILABLE' })

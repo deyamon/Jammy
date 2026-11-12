@@ -34,6 +34,10 @@ test('login and registration render labeled, accessible credential forms', () =>
   assert.match(authPage, /aria-label=\{showPassword \? 'Hide password' : 'Show password'\}/)
   assert.match(authPage, /Your music\.<br\/>Your people\./)
   assert.match(authPage, /LISTEN TOGETHER\. ANYWHERE\./)
+  assert.match(authPage, /Forgot password\?/)
+  assert.match(authPage, /requestPasswordReset/)
+  assert.match(authPage, /resetPassword/)
+  assert.match(authPage, /resendVerificationEmail/)
 })
 
 test('auth is the guest entry, authenticated sessions land on Home, and room invites survive login', () => {
@@ -59,6 +63,9 @@ test('session restoration and expired-session handling use server response as au
   const state = accountStateFromSession({ authenticated: true, user: { id: 'u1', username: 'maya', email: 'maya@example.com', password_hash: 'must-not-copy' }, csrfToken: 'csrf-in-memory' })
   assert.equal(state.status, 'authenticated')
   assert.deepEqual(state.user, { id: 'u1', username: 'maya', email: 'maya@example.com' })
+  const unverified = accountStateFromSession({ authenticated: true, user: { id: 'u2', username: 'listener', email: 'listener@example.com', emailVerified: false } })
+  assert.equal(unverified.user.emailVerified, false)
+  assert.equal('password_hash' in unverified.user, false)
   assert.equal(state.csrfToken, 'csrf-in-memory')
   assert.throws(() => authenticatedAccountState({ user: { username: 'missing-id' } }), /incomplete session/)
   assert.equal(accountStateAfterSessionError(new Error('server unavailable')).status, 'error')
@@ -109,7 +116,10 @@ test('profile displays only available server-provided fields and handles loading
   assert.match(profilePage, /Authenticated account/)
   assert.match(profilePage, /onClick=\{onLogout\} disabled=\{logoutBusy\}/)
   assert.match(profilePage, /logoutBusy \? 'Logging out…' : 'Log out'/)
-  assert.doesNotMatch(profilePage, /Password|Free account/)
+  assert.match(profilePage, /Change password/)
+  assert.match(profilePage, /currentPassword/)
+  assert.match(profilePage, /resendVerificationEmail/)
+  assert.doesNotMatch(profilePage, /Free account/)
 })
 
 test('Neon Auth API restores sessions and delegates sign up, sign in, and logout without storing secrets', async () => {

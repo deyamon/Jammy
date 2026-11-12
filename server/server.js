@@ -16,6 +16,7 @@ import { createSpotifyRouter } from './routes/spotify.js'
 import { AuthService } from './services/authService.js'
 import { isYouTubeApiKeyConfigured, loadProjectEnvironment } from './config.js'
 import { createVoiceIceServerProvider } from './voiceConfig.js'
+import { createAuthEmailWebhook } from './services/authEmailWebhook.js'
 
 loadProjectEnvironment(import.meta.url)
 
@@ -72,6 +73,17 @@ const roomSockets = initializeRoomSockets(io, roomService, queueService, reconne
 
 app.disable('x-powered-by')
 app.use(cors({ origin: allowedOrigins, credentials: true, methods: ['GET', 'POST', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Room-Member-Id', 'X-CSRF-Token'] }))
+const authEmailWebhook = createAuthEmailWebhook()
+app.post('/api/auth/email-webhook', express.raw({ type: 'application/json', limit: '16kb' }), async (request, response) => {
+  try {
+    const result = await authEmailWebhook.handle(request.body, request.headers)
+    response.json({ success: true, duplicate: result.duplicate })
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 503
+    if (status >= 500) console.error('Auth email webhook failed.', { code: 'AUTH_EMAIL_DELIVERY_FAILED' })
+    response.status(status).json({ error: status >= 500 ? 'Auth email delivery is temporarily unavailable.' : 'Invalid auth email webhook.' })
+  }
+})
 app.use(express.json({ limit: '16kb' }))
 
 app.get('/api/health', async (_request, response, next) => {

@@ -39,6 +39,11 @@
 .profile-details dt{color:var(--text-secondary);font-size:11px}
 .profile-details dd{margin:0;color:var(--text-primary);font-size:11px;text-align:right;overflow-wrap:anywhere}
 .account-logout{width:100%;margin-top:0;background:transparent;color:var(--text-primary)}
+.account-security-section{margin:24px 0 0;padding-top:20px;border-top:1px solid var(--border-subtle)}
+.account-security-section h2{margin:0 0 12px;color:var(--text-primary);font:700 16px Manrope,sans-serif}
+.account-security-section .account-intro{margin-bottom:10px}
+.account-security-section .account-form{margin-top:8px}
+.account-security-section .auth-text-button{padding:0;border:0;background:transparent;color:var(--text-primary);font-size:11px;font-weight:700;text-decoration:underline;text-underline-offset:3px}
 @media(max-width:760px){.account-page{min-height:calc(100dvh - 230px);padding:35px 0}.account-card{padding:24px 20px}.account-card h1{font-size:25px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
 

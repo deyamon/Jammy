@@ -102,3 +102,34 @@ test('Better Auth token() may resolve to a cached session payload without any JW
   }
   assert.equal(requestCount, 0, 'the Neon adapter serves the active session from its cache for /token')
 })
+
+test('uses the canonical Neon Auth client for recovery, verification, and password changes', async () => {
+  const calls = []
+  const adapter = {
+    requestPasswordReset: async (input) => { calls.push(['requestPasswordReset', input]); return { data: {} } },
+    resetPassword: async (input) => { calls.push(['resetPassword', input]); return { data: {} } },
+    changePassword: async (input) => { calls.push(['changePassword', input]); return { data: {} } },
+    sendVerificationEmail: async (input) => { calls.push(['sendVerificationEmail', input]); return { data: {} } },
+  }
+  const api = createAccountApi({ adapter, getJWTToken: async () => null })
+  await api.requestPasswordReset({ email: 'a@example.test', redirectTo: 'https://jammy.example.test/?auth=reset' })
+  await api.resetPassword({ token: 'one-time-reset-token', newPassword: 'a-secure-password' })
+  await api.changePassword({ currentPassword: 'old-password', newPassword: 'new-password' })
+  await api.resendVerificationEmail({ email: 'a@example.test', callbackURL: 'https://jammy.example.test/?auth=verified' })
+
+  assert.deepEqual(calls, [
+    ['requestPasswordReset', { email: 'a@example.test', redirectTo: 'https://jammy.example.test/?auth=reset' }],
+    ['resetPassword', { token: 'one-time-reset-token', newPassword: 'a-secure-password' }],
+    ['changePassword', { currentPassword: 'old-password', newPassword: 'new-password', revokeOtherSessions: true }],
+    ['sendVerificationEmail', { email: 'a@example.test', callbackURL: 'https://jammy.example.test/?auth=verified' }],
+  ])
+})
+
+test('converts Neon Auth SDK errors without leaking reset tokens', async () => {
+  const api = createAccountApi({ adapter: { resetPassword: async () => ({ error: { message: 'Bearer top.secret.value reset token=private' } }) } })
+  await assert.rejects(api.resetPassword({ token: 'private', newPassword: 'new-password' }), (error) => {
+    assert.equal(error.name, 'AuthApiError')
+    assert.doesNotMatch(error.message, /private|top\.secret\.value/)
+    return true
+  })
+})

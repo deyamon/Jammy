@@ -9,7 +9,7 @@ export function authenticatedAccountState(payload) {
   }
   return {
     status: 'authenticated',
-    user: { id: user.id, username: user.username, ...(typeof user.email === 'string' ? { email: user.email } : {}), ...(typeof user.createdAt === 'string' ? { createdAt: user.createdAt } : {}) },
+    user: { id: user.id, username: user.username, ...(typeof user.email === 'string' ? { email: user.email } : {}), ...(typeof user.emailVerified === 'boolean' ? { emailVerified: user.emailVerified } : {}), ...(typeof user.createdAt === 'string' ? { createdAt: user.createdAt } : {}) },
     csrfToken: typeof payload.csrfToken === 'string' ? payload.csrfToken : '',
     error: '',
   }
