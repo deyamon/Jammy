@@ -23,6 +23,14 @@ The example config uses an in-memory room store so the room flow works locally w
 3. Put the key in the backend `.env` file as `YOUTUBE_API_KEY=...`. Do not use a `VITE_` variable, place it in browser code, or commit the real key.
 4. Restart `npm run server`. Search requests go through `GET /api/youtube/search`; the backend asks for embeddable videos and checks each result's Made for Kids and embed status before returning it. Identical searches are coalesced and briefly cached in memory; the server does not cache video or audio content.
 
+### Music-first search relevance
+
+Jammy searches YouTube videos in relevance order and requests up to 50 embeddable candidates from the Music category. The backend batches eligibility, category, and duration checks through one `videos.list` request, then deterministically ranks title, channel, description, query-token coverage, music labels, version intent, negative title signals, and duration. Exact user terms are preserved; `live`, `lyrics`, `cover`, `acoustic`, `remix`, and explicit album terms are treated as intent hints rather than appended to the search.
+
+If the Music category returns fewer than five useful matches, the service performs one broader video search with the original query and ranks the combined candidates. Duplicate IDs and routine audio/video re-uploads are collapsed; live, acoustic, cover, remix, and lyric variants remain available. Explicit Shorts labels receive a strong penalty, while short duration alone does not remove a result. Search results include classifications used by the Search page's All, Songs, Live, Covers, Lyrics, and Remixes filters; the page reveals 12 at a time from the cached candidate set.
+
+Official-channel detection uses channel-title text such as VEVO, Topic, Official, or Records because YouTube Data API video metadata does not provide a dependable verified-channel badge. These are ranking signals, not proof of channel ownership. Artist-versus-song parsing is intentionally lightweight and uses token coverage; exact song knowledge and aliases would require a maintained catalog or another data source.
+
 If the key is missing, the Search page explains that YouTube search is not configured. Quota exhaustion and upstream API errors also return user-facing messages. Search uses your Google Cloud project's current quota.
 
 ### Enable PostgreSQL (including Neon)

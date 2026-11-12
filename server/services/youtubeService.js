@@ -1,10 +1,13 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
+import { rankMusicResults } from './youtubeRelevance.js'
 
 const SEARCH_URL = 'https://www.googleapis.com/youtube/v3/search'
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/
 const CACHE_TTL_MS = 60_000
 const MAX_CACHE_ITEMS = 100
 const SELECTION_TTL_MS = 10 * 60 * 1000
+const CANDIDATE_LIMIT = 50
+const FALLBACK_MIN_USEFUL_RESULTS = 5
 
 function selectionPayload(result) {
   return JSON.stringify({ videoId: result.videoId, title: result.title, channelName: result.channelName, thumbnails: result.thumbnails })
@@ -35,9 +38,22 @@ function resultFrom(item) {
     videoId,
     title: typeof snippet.title === 'string' ? snippet.title : 'Untitled video',
     channelName: typeof snippet.channelTitle === 'string' ? snippet.channelTitle : 'YouTube channel',
+    description: typeof snippet.description === 'string' ? snippet.description : '',
+    categoryId: typeof snippet.categoryId === 'string' ? snippet.categoryId : '',
     thumbnails: { default: thumb('default'), medium: thumb('medium'), high: thumb('high') },
     provider: 'youtube',
   }
+}
+
+function durationSeconds(value) {
+  if (typeof value !== 'string') return null
+  const match = value.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/)
+  return match ? Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0) : null
+}
+
+function publicSearchResult(result) {
+  const { description, categoryId, score, titleCoverage, channelCoverage, queryCoverage, officialChannel, ...publicResult } = result
+  return publicResult
 }
 
 export class YouTubeService {
@@ -49,16 +65,16 @@ export class YouTubeService {
     this.inFlight = new Map()
   }
 
-  async search(rawQuery) {
+  async search(rawQuery, { purpose = 'music-discovery' } = {}) {
     const query = cleanYouTubeQuery(rawQuery)
     if (!this.apiKey) throw new YouTubeApiError(503, 'YouTube search is not configured. Set YOUTUBE_API_KEY=your_key in the project-root .env file, then restart npm run server. Do not put the key in .env.example or a VITE_ variable.', 'YOUTUBE_NOT_CONFIGURED')
-    const cacheKey = query.toLowerCase()
+    const cacheKey = `${purpose}:${query.toLowerCase()}`
     for (const [key, entry] of this.cache) if (entry.expiresAt <= this.now()) this.cache.delete(key)
     const cached = this.cache.get(cacheKey)
     if (cached && cached.expiresAt > this.now()) return cached.results
     if (this.inFlight.has(cacheKey)) return this.inFlight.get(cacheKey)
 
-    const request = this.fetchResults(query).then((results) => {
+    const request = this.fetchResults(query, { retainWeakMatches: purpose === 'autoplay' }).then((results) => {
       const signedResults = results.map((result) => this.signSelection(result))
       this.cache.delete(cacheKey)
       const entry = { results: signedResults, expiresAt: this.now() + CACHE_TTL_MS }
@@ -89,12 +105,40 @@ export class YouTubeService {
     return actual.length === expected.length && timingSafeEqual(actual, expected)
   }
 
-  async fetchResults(query) {
+  async fetchResults(query, { retainWeakMatches = false } = {}) {
     if (typeof this.fetchImpl !== 'function') throw new YouTubeApiError(503, 'YouTube search is unavailable on this server.', 'YOUTUBE_UNAVAILABLE')
+    const musicResults = await this.fetchCandidateSet(query, true)
+    const rankedMusicResults = rankMusicResults(query, musicResults)
+    // Autoplay already uses a small set of targeted artist/song queries; keep
+    // each one to a single YouTube search to protect quota and related-artist
+    // candidates that intentionally do not share query tokens.
+    if (retainWeakMatches) return rankedMusicResults.map(publicSearchResult)
+    const usefulMusicResults = rankedMusicResults.filter((item) => item.musicRelated && item.queryCoverage >= 0.5 && item.score >= 20)
+    if (usefulMusicResults.length >= FALLBACK_MIN_USEFUL_RESULTS) return rankedMusicResults.map(publicSearchResult)
+
+    // Category 10 misses some miscategorized videos. Relax it once, keep the
+    // original query unchanged, then rank and deduplicate the combined pool.
+    let broadResults
+    try { broadResults = await this.fetchCandidateSet(query, false) }
+    catch (error) {
+      // A failed relaxation must not discard usable strict-category matches.
+      if (musicResults.length) return rankedMusicResults.map(publicSearchResult)
+      throw error
+    }
+    const ranked = rankMusicResults(query, [...musicResults, ...broadResults])
+    if (retainWeakMatches) return ranked.map(publicSearchResult)
+    const relevant = ranked.filter((item) => item.score >= 0 && (item.musicRelated || item.queryCoverage >= 0.5))
+    return (relevant.length ? relevant : ranked.slice(0, 12)).map(publicSearchResult)
+  }
+
+  async fetchCandidateSet(query, musicOnly) {
     const url = new URL(SEARCH_URL)
-    url.search = new URLSearchParams({
-      part: 'snippet', type: 'video', videoEmbeddable: 'true', maxResults: '12', q: query, key: this.apiKey,
-    }).toString()
+    const parameters = {
+      part: 'snippet', type: 'video', videoEmbeddable: 'true', maxResults: String(CANDIDATE_LIMIT),
+      order: 'relevance', q: query, key: this.apiKey,
+    }
+    if (musicOnly) parameters.videoCategoryId = '10'
+    url.search = new URLSearchParams(parameters).toString()
     let response
     try { response = await this.fetchImpl(url, { headers: { Accept: 'application/json' } }) }
     catch { throw new YouTubeApiError(502, 'YouTube search could not be reached. Try again shortly.', 'YOUTUBE_UPSTREAM_UNAVAILABLE') }
@@ -113,9 +157,10 @@ export class YouTubeService {
     const results = (Array.isArray(body.items) ? body.items : []).map(resultFrom).filter(Boolean)
     if (!results.length) return []
 
-    // YouTube's current API policies require checking Made for Kids status before embedding.
+    // One videos.list call supplies eligibility plus category/duration details
+    // for up to 50 candidates; no per-result API requests are made.
     const statusUrl = new URL('https://www.googleapis.com/youtube/v3/videos')
-    statusUrl.search = new URLSearchParams({ part: 'status', id: results.map((item) => item.videoId).join(','), key: this.apiKey }).toString()
+    statusUrl.search = new URLSearchParams({ part: 'snippet,contentDetails,status', id: results.map((item) => item.videoId).join(','), key: this.apiKey }).toString()
     let statusResponse
     try { statusResponse = await this.fetchImpl(statusUrl, { headers: { Accept: 'application/json' } }) }
     catch { throw new YouTubeApiError(502, 'YouTube video eligibility could not be checked. Try again shortly.', 'YOUTUBE_UPSTREAM_UNAVAILABLE') }
@@ -129,10 +174,17 @@ export class YouTubeService {
       }
       throw new YouTubeApiError(statusResponse.status === 403 ? 403 : 502, 'YouTube video eligibility could not be checked. Try again shortly.', 'YOUTUBE_STATUS_CHECK_FAILED')
     }
-    const eligible = new Set((Array.isArray(statusBody.items) ? statusBody.items : [])
-      .filter((item) => item.status?.madeForKids === false && item.status?.embeddable === true)
-      .map((item) => item.id))
-    return results.filter((item) => eligible.has(item.videoId))
+    const details = new Map((Array.isArray(statusBody.items) ? statusBody.items : []).map((item) => [item.id, item]))
+    return results.flatMap((result) => {
+      const detail = details.get(result.videoId)
+      if (detail?.status?.madeForKids !== false || detail?.status?.embeddable !== true) return []
+      return [{
+        ...result,
+        description: detail.snippet?.description || result.description,
+        categoryId: String(detail.snippet?.categoryId || result.categoryId || ''),
+        durationSeconds: durationSeconds(detail.contentDetails?.duration),
+      }]
+    })
   }
 }
 

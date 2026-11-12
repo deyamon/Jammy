@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { createRemoteJWKSet, jwtVerify } from 'jose'
 import { isYouTubeVideoId } from '../services/youtubeService.js'
-import { buildMusicTasteProfile, personalizedYouTubeQuery } from '../services/musicTaste.js'
+import { buildMusicTasteProfile } from '../services/musicTaste.js'
 
 const remoteKeys = new Map()
 
@@ -139,8 +139,9 @@ export function createMusicRouter({ pool, youtubeService, authenticator = create
         try { profileResult = await pool.query('SELECT profile_json FROM music_taste_profiles WHERE user_id = $1', [request.musicUserId]) }
         catch { /* Account taste storage or migration may be unavailable; preserve generic YouTube search. */ }
       }
-      const query = personalizedYouTubeQuery(rawQuery, profileResult.rows[0]?.profile_json)
-      const results = await youtubeService.search(query)
+      // Preserve the exact user query. Appending favorite artists to a song
+      // search can turn a precise request into a different, noisier query.
+      const results = await youtubeService.search(rawQuery)
       response.set('Cache-Control', 'no-store').json({ results, personalized: Boolean(profileResult.rows[0]?.profile_json?.favoriteArtists?.length) })
     } catch (error) { next(error) }
   })

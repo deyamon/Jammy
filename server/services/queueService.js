@@ -630,7 +630,9 @@ export class QueueService {
 
       let results
       try {
-        results = await this.youtubeService.search(query)
+        // Autoplay also searches for adjacent artists, where a candidate is
+        // intentionally allowed to have little lexical overlap with the query.
+        results = await this.youtubeService.search(query, { purpose: 'autoplay' })
 
         // Record only completed searches, allowing failed searches to retry.
         memory.searches.add(queryKey)

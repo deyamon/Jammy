@@ -107,3 +107,20 @@ test('Home history endpoint reports pending schema instead of a generic server f
   assert.equal(response.status, 503)
   assert.equal((await response.json()).code, 'MUSIC_MIGRATION_REQUIRED')
 })
+
+test('personal music search preserves the exact user query when taste preferences exist', async (t) => {
+  let searchedQuery = ''
+  const app = express()
+  app.use('/api/music', createMusicRouter({
+    pool: { async query() { return { rows: [{ profile_json: { favoriteArtists: [{ name: 'Taylor Swift' }] } }] } } },
+    youtubeService: { async search(query) { searchedQuery = query; return [] } },
+    authenticator(request, _response, next) { request.musicUserId = 'verified-neon-subject'; next() },
+  }))
+  const server = createServer(app)
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/music/youtube-search?q=Harry%20Styles%20As%20It%20Was`)
+  assert.equal(response.status, 200)
+  assert.equal(searchedQuery, 'Harry Styles As It Was')
+  assert.equal((await response.json()).personalized, true)
+})
